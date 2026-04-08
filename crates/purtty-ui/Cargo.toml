@@ -10,3 +10,8 @@ description = "wgpu renderer and input for purtty"
 purtty-term = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+winit = { workspace = true }
+
+wgpu = "22"
+glyphon = "0.6"
+pollster = "0.3"

@@ -1,12 +1,15 @@
 //! purtty — binary entry point.
 //!
-//! M0: open an empty winit window. Closing the window exits the app.
-//! Real rendering arrives in M1, PTY in M3, full integration in M4.
+//! M1: opens a winit window, initializes a wgpu surface, and renders
+//! a fixed greeting via glyphon. Closing the window exits the app.
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use anyhow::Result;
-use tracing::{info, warn};
+use purtty_ui::Renderer;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -16,7 +19,8 @@ use winit::window::{Window, WindowId};
 /// Top-level application state held across the winit event loop.
 #[derive(Default)]
 struct PurttyApp {
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
 }
 
 impl ApplicationHandler for PurttyApp {
@@ -27,20 +31,34 @@ impl ApplicationHandler for PurttyApp {
         let attrs = Window::default_attributes()
             .with_title("purtty")
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
-        match event_loop.create_window(attrs) {
-            Ok(window) => {
-                info!(
-                    size = ?window.inner_size(),
-                    scale_factor = window.scale_factor(),
-                    "window created"
-                );
-                self.window = Some(window);
-            }
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
             Err(err) => {
                 warn!(?err, "failed to create window");
                 event_loop.exit();
+                return;
+            }
+        };
+        info!(
+            size = ?window.inner_size(),
+            scale_factor = window.scale_factor(),
+            "window created"
+        );
+
+        match Renderer::new(window.clone()) {
+            Ok(r) => {
+                self.renderer = Some(r);
+                info!("renderer ready");
+                window.request_redraw();
+            }
+            Err(err) => {
+                error!(?err, "failed to initialize renderer");
+                event_loop.exit();
+                return;
             }
         }
+
+        self.window = Some(window);
     }
 
     fn window_event(
@@ -56,9 +74,19 @@ impl ApplicationHandler for PurttyApp {
             }
             WindowEvent::Resized(size) => {
                 info!(?size, "resized");
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size);
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::RedrawRequested => {
-                // Nothing to draw yet. GPU renderer lands in M1.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    if let Err(err) = renderer.render() {
+                        warn!(?err, "render failed");
+                    }
+                }
             }
             _ => {}
         }
