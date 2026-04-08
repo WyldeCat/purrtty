@@ -1,8 +1,7 @@
 //! wgpu + glyphon renderer.
 //!
-//! M1 scope: initialize a wgpu surface for the given window, clear
-//! to a dark background, and draw a fixed greeting string via
-//! glyphon. Grid rendering lands in M4.
+//! Renders a [`Grid`] as monochrome text on a dark background via
+//! glyphon. Color attributes and a blinking cursor land in M4 polish.
 
 use std::sync::Arc;
 
@@ -11,12 +10,24 @@ use glyphon::{
     Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
+use purrtty_term::Grid;
 use wgpu::{
     CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor, LoadOp, MultisampleState,
     Operations, PresentMode, RenderPassColorAttachment, RenderPassDescriptor,
     RequestAdapterOptions, StoreOp, SurfaceConfiguration, TextureUsages, TextureViewDescriptor,
 };
 use winit::{dpi::PhysicalSize, window::Window};
+
+/// Font size in physical pixels.
+const FONT_SIZE: f32 = 18.0;
+/// Line height in physical pixels (font size * ~1.22).
+const LINE_HEIGHT: f32 = 22.0;
+/// Approximate monospace advance width in physical pixels. Slightly over a
+/// half em for most monospace fonts at 18px.
+const CELL_WIDTH: f32 = 10.0;
+/// Inner window padding (physical pixels).
+const PAD_X: f32 = 16.0;
+const PAD_Y: f32 = 16.0;
 
 /// Owns wgpu + glyphon state tied to a single window/surface.
 pub struct Renderer {
@@ -52,10 +63,9 @@ impl Renderer {
         }))
         .ok_or_else(|| anyhow!("no suitable wgpu adapter found"))?;
 
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&DeviceDescriptor::default(), None),
-        )
-        .context("request wgpu device")?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&DeviceDescriptor::default(), None))
+                .context("request wgpu device")?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -85,16 +95,8 @@ impl Renderer {
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
-        let metrics = Metrics::new(18.0, 22.0);
-        let mut buffer = Buffer::new(&mut font_system, metrics);
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         buffer.set_size(&mut font_system, Some(width as f32), Some(height as f32));
-        buffer.set_text(
-            &mut font_system,
-            "hello purrtty",
-            Attrs::new().family(Family::Monospace),
-            Shaping::Advanced,
-        );
-        buffer.shape_until_scroll(&mut font_system, false);
 
         Ok(Self {
             window,
@@ -111,6 +113,15 @@ impl Renderer {
         })
     }
 
+    /// Terminal grid dimensions, in cells, that fit the current surface.
+    pub fn grid_dimensions(&self) -> (u16, u16) {
+        let w = (self.config.width as f32 - 2.0 * PAD_X).max(0.0);
+        let h = (self.config.height as f32 - 2.0 * PAD_Y).max(0.0);
+        let cols = (w / CELL_WIDTH).floor().max(1.0) as u16;
+        let rows = (h / LINE_HEIGHT).floor().max(1.0) as u16;
+        (rows, cols)
+    }
+
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
@@ -125,7 +136,7 @@ impl Renderer {
         );
     }
 
-    pub fn render(&mut self) -> Result<()> {
+    pub fn render(&mut self, grid: &Grid) -> Result<()> {
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -134,7 +145,30 @@ impl Renderer {
             },
         );
 
-        let scale = self.window.scale_factor() as f32;
+        // Build the frame text by flattening the grid row-by-row.
+        let rows = grid.rows();
+        let cols = grid.cols();
+        let mut text = String::with_capacity(rows * (cols + 1));
+        for row in grid.rows_iter() {
+            for cell in row {
+                text.push(cell.ch);
+            }
+            text.push('\n');
+        }
+        // drop trailing newline so cosmic-text doesn't reserve an extra line
+        if text.ends_with('\n') {
+            text.pop();
+        }
+
+        self.buffer.set_text(
+            &mut self.font_system,
+            &text,
+            Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+        );
+        self.buffer
+            .shape_until_scroll(&mut self.font_system, false);
+
         self.text_renderer
             .prepare(
                 &self.device,
@@ -144,9 +178,9 @@ impl Renderer {
                 &self.viewport,
                 [TextArea {
                     buffer: &self.buffer,
-                    left: 20.0,
-                    top: 20.0,
-                    scale,
+                    left: PAD_X,
+                    top: PAD_Y,
+                    scale: 1.0,
                     bounds: TextBounds {
                         left: 0,
                         top: 0,
@@ -200,6 +234,7 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         self.atlas.trim();
+        let _ = &self.window; // keep window reference live for surface 'static
         Ok(())
     }
 }

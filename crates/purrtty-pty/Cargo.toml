@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "PTY spawning and I/O for purrtty"
 
 [dependencies]
-purrtty-term = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+portable-pty = "0.8"

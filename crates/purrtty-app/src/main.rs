@@ -1,29 +1,62 @@
 //! purrtty — binary entry point.
 //!
-//! M1: opens a winit window, initializes a wgpu surface, and renders
-//! a fixed greeting via glyphon. Closing the window exits the app.
+//! M3: wires a real PTY-backed shell to the VT parser and the wgpu
+//! renderer. The event loop owns the renderer, the PTY session, and a
+//! shared `Terminal` that both the UI thread and the PTY reader thread
+//! mutate under a mutex. Keyboard input is translated to bytes and
+//! pushed into the PTY; the reader thread feeds incoming bytes into
+//! the VT parser and wakes the UI via an `EventLoopProxy`.
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use purrtty_pty::PtySession;
+use purrtty_term::Terminal;
 use purrtty_ui::Renderer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-/// Top-level application state held across the winit event loop.
-#[derive(Default)]
-struct PurttyApp {
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
+/// Events posted to the winit loop from background threads.
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    /// Bytes arrived from the PTY; redraw is needed.
+    PtyDataArrived,
 }
 
-impl ApplicationHandler for PurttyApp {
+type SharedTerminal = Arc<Mutex<Terminal>>;
+
+#[derive(Default)]
+struct PurrttyApp {
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    pty: Option<PtySession>,
+    terminal: Option<SharedTerminal>,
+    proxy: Option<EventLoopProxy<UserEvent>>,
+}
+
+impl PurrttyApp {
+    fn with_proxy(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self {
+            proxy: Some(proxy),
+            ..Self::default()
+        }
+    }
+
+    fn redraw(&self) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for PurrttyApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -34,7 +67,7 @@ impl ApplicationHandler for PurttyApp {
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(err) => {
-                warn!(?err, "failed to create window");
+                error!(?err, "failed to create window");
                 event_loop.exit();
                 return;
             }
@@ -45,20 +78,51 @@ impl ApplicationHandler for PurttyApp {
             "window created"
         );
 
-        match Renderer::new(window.clone()) {
-            Ok(r) => {
-                self.renderer = Some(r);
-                info!("renderer ready");
-                window.request_redraw();
-            }
+        let renderer = match Renderer::new(window.clone()) {
+            Ok(r) => r,
             Err(err) => {
                 error!(?err, "failed to initialize renderer");
                 event_loop.exit();
                 return;
             }
-        }
+        };
 
-        self.window = Some(window);
+        let (rows, cols) = renderer.grid_dimensions();
+        info!(rows, cols, "initial grid dimensions");
+
+        let terminal = Arc::new(Mutex::new(Terminal::new(rows as usize, cols as usize)));
+
+        let terminal_for_reader = terminal.clone();
+        let proxy_for_reader = self
+            .proxy
+            .clone()
+            .expect("proxy set before ApplicationHandler::resumed");
+
+        let pty = match PtySession::spawn(rows, cols, move |bytes| {
+            if let Ok(mut term) = terminal_for_reader.lock() {
+                term.advance(bytes);
+            }
+            let _ = proxy_for_reader.send_event(UserEvent::PtyDataArrived);
+        }) {
+            Ok(p) => p,
+            Err(err) => {
+                error!(?err, "failed to spawn pty");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        self.window = Some(window.clone());
+        self.renderer = Some(renderer);
+        self.pty = Some(pty);
+        self.terminal = Some(terminal);
+        window.request_redraw();
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::PtyDataArrived => self.redraw(),
+        }
     }
 
     fn window_event(
@@ -73,24 +137,86 @@ impl ApplicationHandler for PurttyApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                info!(?size, "resized");
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
+                    let (rows, cols) = renderer.grid_dimensions();
+                    if let Some(terminal) = self.terminal.as_ref() {
+                        if let Ok(mut term) = terminal.lock() {
+                            term.grid_mut().resize(rows as usize, cols as usize);
+                        }
+                    }
+                    if let Some(pty) = self.pty.as_ref() {
+                        if let Err(err) = pty.resize(rows, cols) {
+                            warn!(?err, "pty resize failed");
+                        }
+                    }
                 }
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                self.redraw();
             }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    if let Err(err) = renderer.render() {
-                        warn!(?err, "render failed");
+                let renderer = match self.renderer.as_mut() {
+                    Some(r) => r,
+                    None => return,
+                };
+                let terminal = match self.terminal.as_ref() {
+                    Some(t) => t,
+                    None => return,
+                };
+                let guard = match terminal.lock() {
+                    Ok(g) => g,
+                    Err(err) => {
+                        warn!(?err, "terminal mutex poisoned");
+                        return;
+                    }
+                };
+                if let Err(err) = renderer.render(guard.grid()) {
+                    warn!(?err, "render failed");
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let Some(bytes) = key_event_to_bytes(&event) {
+                    if let Some(pty) = self.pty.as_mut() {
+                        if let Err(err) = pty.write(&bytes) {
+                            warn!(?err, "pty write failed");
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Translate a winit `KeyEvent` into the bytes a shell expects on stdin.
+///
+/// This is the minimum usable set: Enter, Tab, Backspace, Escape, arrow
+/// keys, and whatever characters winit gives us in `text` (which already
+/// accounts for the keyboard layout and modifiers for printable input).
+fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
+    if event.state != ElementState::Pressed {
+        return None;
+    }
+
+    if let Key::Named(named) = &event.logical_key {
+        return match named {
+            NamedKey::Enter => Some(b"\r".to_vec()),
+            NamedKey::Tab => Some(b"\t".to_vec()),
+            NamedKey::Backspace => Some(b"\x7f".to_vec()),
+            NamedKey::Escape => Some(b"\x1b".to_vec()),
+            NamedKey::ArrowUp => Some(b"\x1b[A".to_vec()),
+            NamedKey::ArrowDown => Some(b"\x1b[B".to_vec()),
+            NamedKey::ArrowRight => Some(b"\x1b[C".to_vec()),
+            NamedKey::ArrowLeft => Some(b"\x1b[D".to_vec()),
+            NamedKey::Home => Some(b"\x1b[H".to_vec()),
+            NamedKey::End => Some(b"\x1b[F".to_vec()),
+            NamedKey::Delete => Some(b"\x1b[3~".to_vec()),
+            NamedKey::PageUp => Some(b"\x1b[5~".to_vec()),
+            NamedKey::PageDown => Some(b"\x1b[6~".to_vec()),
+            _ => None,
+        };
+    }
+
+    event.text.as_ref().map(|t| t.as_bytes().to_vec())
 }
 
 fn init_tracing() {
@@ -106,10 +232,11 @@ fn main() -> Result<()> {
     init_tracing();
     info!(version = env!("CARGO_PKG_VERSION"), "starting purrtty");
 
-    let event_loop = EventLoop::new()?;
+    let event_loop: EventLoop<UserEvent> = EventLoop::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = PurttyApp::default();
+    let proxy = event_loop.create_proxy();
+    let mut app = PurrttyApp::with_proxy(proxy);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
