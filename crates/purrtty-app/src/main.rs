@@ -197,23 +197,30 @@ fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
         return None;
     }
 
+    // Named keys we translate to explicit escape sequences. For any other
+    // named key (Space, letters composed with modifiers, etc.) we fall
+    // through to the text fallback below, which winit fills in with the
+    // already-composed character(s).
     if let Key::Named(named) = &event.logical_key {
-        return match named {
-            NamedKey::Enter => Some(b"\r".to_vec()),
-            NamedKey::Tab => Some(b"\t".to_vec()),
-            NamedKey::Backspace => Some(b"\x7f".to_vec()),
-            NamedKey::Escape => Some(b"\x1b".to_vec()),
-            NamedKey::ArrowUp => Some(b"\x1b[A".to_vec()),
-            NamedKey::ArrowDown => Some(b"\x1b[B".to_vec()),
-            NamedKey::ArrowRight => Some(b"\x1b[C".to_vec()),
-            NamedKey::ArrowLeft => Some(b"\x1b[D".to_vec()),
-            NamedKey::Home => Some(b"\x1b[H".to_vec()),
-            NamedKey::End => Some(b"\x1b[F".to_vec()),
-            NamedKey::Delete => Some(b"\x1b[3~".to_vec()),
-            NamedKey::PageUp => Some(b"\x1b[5~".to_vec()),
-            NamedKey::PageDown => Some(b"\x1b[6~".to_vec()),
+        let mapped: Option<&'static [u8]> = match named {
+            NamedKey::Enter => Some(b"\r"),
+            NamedKey::Tab => Some(b"\t"),
+            NamedKey::Backspace => Some(b"\x7f"),
+            NamedKey::Escape => Some(b"\x1b"),
+            NamedKey::ArrowUp => Some(b"\x1b[A"),
+            NamedKey::ArrowDown => Some(b"\x1b[B"),
+            NamedKey::ArrowRight => Some(b"\x1b[C"),
+            NamedKey::ArrowLeft => Some(b"\x1b[D"),
+            NamedKey::Home => Some(b"\x1b[H"),
+            NamedKey::End => Some(b"\x1b[F"),
+            NamedKey::Delete => Some(b"\x1b[3~"),
+            NamedKey::PageUp => Some(b"\x1b[5~"),
+            NamedKey::PageDown => Some(b"\x1b[6~"),
             _ => None,
         };
+        if let Some(bytes) = mapped {
+            return Some(bytes.to_vec());
+        }
     }
 
     event.text.as_ref().map(|t| t.as_bytes().to_vec())

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use glyphon::{
     Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
 use purrtty_term::Grid;
 use wgpu::{
@@ -96,6 +96,11 @@ impl Renderer {
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        // Terminals are column-oriented: one grid row = one visual line.
+        // Disable cosmic-text's soft-wrap so a row wider than the buffer
+        // just gets clipped instead of flowing into extra visual lines
+        // that would push the cursor off the bottom of the window.
+        buffer.set_wrap(&mut font_system, Wrap::None);
         buffer.set_size(&mut font_system, Some(width as f32), Some(height as f32));
 
         Ok(Self {
