@@ -1,0 +1,12 @@
+[package]
+name = "purtty-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wgpu renderer and input for purtty"
+
+[dependencies]
+purtty-term = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

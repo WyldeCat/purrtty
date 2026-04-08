@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/purtty-term",
+    "crates/purtty-pty",
+    "crates/purtty-ui",
+    "crates/purtty-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wyldecat/purtty"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Internal crates
+purtty-term = { path = "crates/purtty-term" }
+purtty-pty = { path = "crates/purtty-pty" }
+purtty-ui = { path = "crates/purtty-ui" }
+
+# Error / logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Windowing / GPU (used in later milestones, declared here for consistency)
+winit = "0.30"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,22 @@
+[package]
+name = "purtty-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "purtty — GPU-accelerated terminal emulator"
+default-run = "purtty"
+
+[[bin]]
+name = "purtty"
+path = "src/main.rs"
+
+[dependencies]
+purtty-term = { workspace = true }
+purtty-pty = { workspace = true }
+purtty-ui = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+winit = { workspace = true }

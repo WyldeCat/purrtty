@@ -1,0 +1,12 @@
+[package]
+name = "purtty-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PTY spawning and I/O for purtty"
+
+[dependencies]
+purtty-term = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
