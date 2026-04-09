@@ -44,7 +44,10 @@ enum InputMode {
     Normal,
     /// User is composing an agent prompt (triggered by `>`). Keys are
     /// buffered locally and echoed to the grid; the shell sees nothing.
-    AgentInput { buffer: String },
+    /// `start_col` is the 0-indexed grid column where the `> ` marker
+    /// was drawn — used to erase only our echoed text on refresh,
+    /// preserving the shell prompt to the left.
+    AgentInput { buffer: String, start_col: usize },
     /// An agent process is running. All keyboard input is swallowed
     /// except Ctrl+C which kills the agent.
     AgentRunning,
@@ -128,8 +131,16 @@ impl PurrttyApp {
 
         // Detect `>` at the start of empty shell input → agent mode.
         if bytes == b">" && self.shell_input_empty {
+            // Remember the cursor column so refresh_agent_line erases
+            // only our echoed text, not the shell prompt to the left.
+            let start_col = self
+                .terminal
+                .as_ref()
+                .and_then(|t| t.lock().ok().map(|g| g.grid().cursor().col))
+                .unwrap_or(0);
             self.input_mode = InputMode::AgentInput {
                 buffer: String::new(),
+                start_col,
             };
             // Echo a bold-cyan `> ` marker into the terminal grid.
             self.echo_to_terminal(b"\x1b[1;36m> \x1b[0m");
@@ -163,9 +174,13 @@ impl PurrttyApp {
             return;
         }
 
-        // Esc → cancel agent input, erase the echoed line.
+        // Esc → cancel agent input, erase the echoed text.
         if event.logical_key == Key::Named(NamedKey::Escape) {
-            self.echo_to_terminal(b"\r\x1b[2K"); // CR + erase line
+            let start_col = match &self.input_mode {
+                InputMode::AgentInput { start_col, .. } => *start_col,
+                _ => 0,
+            };
+            self.refresh_agent_line("", start_col);
             self.input_mode = InputMode::Normal;
             self.redraw();
             return;
@@ -173,12 +188,12 @@ impl PurrttyApp {
 
         // Enter → launch the agent.
         if event.logical_key == Key::Named(NamedKey::Enter) {
-            let buffer = match std::mem::take(&mut self.input_mode) {
-                InputMode::AgentInput { buffer } => buffer,
+            let (buffer, start_col) = match std::mem::take(&mut self.input_mode) {
+                InputMode::AgentInput { buffer, start_col } => (buffer, start_col),
                 _ => unreachable!(),
             };
             if buffer.trim().is_empty() {
-                self.echo_to_terminal(b"\r\x1b[2K");
+                self.refresh_agent_line("", start_col);
                 self.input_mode = InputMode::Normal;
                 self.redraw();
                 return;
@@ -191,10 +206,11 @@ impl PurrttyApp {
 
         // Backspace → remove last char from buffer.
         if event.logical_key == Key::Named(NamedKey::Backspace) {
-            if let InputMode::AgentInput { buffer } = &mut self.input_mode {
+            if let InputMode::AgentInput { buffer, start_col } = &mut self.input_mode {
                 if buffer.pop().is_some() {
                     let snap = buffer.clone();
-                    self.refresh_agent_line(&snap);
+                    let col = *start_col;
+                    self.refresh_agent_line(&snap, col);
                     self.redraw();
                 }
             }
@@ -204,21 +220,33 @@ impl PurrttyApp {
         // Printable text → append to buffer.
         if let Some(text) = &event.text {
             if !text.is_empty() {
-                if let InputMode::AgentInput { buffer } = &mut self.input_mode {
+                if let InputMode::AgentInput { buffer, start_col } = &mut self.input_mode {
                     buffer.push_str(text.as_str());
                     let snap = buffer.clone();
-                    self.refresh_agent_line(&snap);
+                    let col = *start_col;
+                    self.refresh_agent_line(&snap, col);
                     self.redraw();
                 }
             }
         }
     }
 
-    /// Redraw the entire agent input line from scratch. Avoids the
-    /// `\x08 \x08` single-char erase which can leave rendering artifacts
-    /// with certain fonts or multi-byte characters.
-    fn refresh_agent_line(&self, buffer: &str) {
-        let line = format!("\r\x1b[2K\x1b[1;36m> \x1b[0m{}", buffer);
+    /// Redraw the agent input from `start_col` onwards, preserving the
+    /// shell prompt to the left. Uses CHA (cursor horizontal absolute)
+    /// to jump to the saved column and EL mode 0 to erase only from
+    /// that point to end of line.
+    fn refresh_agent_line(&self, buffer: &str, start_col: usize) {
+        // CHA is 1-indexed.
+        let line = if buffer.is_empty() {
+            // Erase the agent marker entirely.
+            format!("\x1b[{}G\x1b[K", start_col + 1)
+        } else {
+            format!(
+                "\x1b[{}G\x1b[K\x1b[1;36m> \x1b[0m{}",
+                start_col + 1,
+                buffer
+            )
+        };
         self.echo_to_terminal(line.as_bytes());
     }
 
