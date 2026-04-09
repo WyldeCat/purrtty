@@ -207,6 +207,36 @@ above it.
 - **IME composition.** Forward `WindowEvent::Ime` preedit to a
   temporary overlay; commit inserts bytes via pty.
 
+**Performance.** Current M3-era renderer rebuilds one giant string
+from the whole grid on every frame and hands it to cosmic-text,
+which re-shapes the entire paragraph from scratch. At larger window
+sizes this is visibly laggy. Per-cell positioning (above) removes
+the need to go through cosmic-text's paragraph layout at all, which
+unlocks the following optimizations — **target ≥60 fps at
+200×60 cells on a Retina display**:
+
+- **Dirty tracking.** Grid marks rows as dirty on mutation; the
+  renderer only re-shapes and re-uploads those rows. Scroll is a
+  bulk dirty (all rows). Adds `dirty: Vec<bool>` or a row-generation
+  counter to `Grid`.
+- **ASCII fast path.** For cells with width 1 and an ASCII code
+  point, skip cosmic-text shaping and use a pre-built glyph atlas
+  (cached by `(char, font, weight, italic)`). Fall back to full
+  shaping for non-ASCII and wide glyphs.
+- **Row-level shaping cache.** Keep a per-row shaped buffer keyed
+  by row content hash; invalidate only when the row changes.
+- **Redraw coalescing.** PTY reader currently wakes the UI on
+  every chunk. Debounce with a winit `ControlFlow::WaitUntil` +
+  "dirty since last paint" flag so we cap at ~60 Hz even if the
+  shell is spewing output at MB/s.
+- **Off-screen culling.** While the view is scrolled into
+  scrollback, live-grid mutations still cause a full repaint. Skip
+  redraw entirely when `scroll_offset > 0` and nothing in the
+  visible slice changed (use the row-generation counter to check).
+- **Atlas pressure.** `atlas.trim()` is called every frame today;
+  move it to "every N frames" or "on atlas near-full" to cut down
+  CPU work in the common case.
+
 ### M5 🔜 Polish & packaging
 - `~/.config/purrtty/config.toml` (font family/size, color scheme,
   initial window size)
@@ -297,6 +327,11 @@ the milestone they're slated to be fixed in.
 - **No Korean IME composition.** Single code points go through
   (wide-char logical fix), but macOS IME preedit/commit isn't wired
   up. M4 forwards `WindowEvent::Ime`.
+- **Render lag at large window sizes.** Every frame rebuilds the
+  whole grid text and re-shapes it via cosmic-text. Noticeable lag
+  when the window gets big. M4's per-cell positioning unlocks dirty
+  tracking, row-level shaping cache, ASCII fast path, and redraw
+  coalescing — see the **Performance** block inside M4.
 
 ## Out of Scope for v0.1 (v2+ Backlog)
 
