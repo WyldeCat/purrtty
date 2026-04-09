@@ -7,7 +7,7 @@ use bitflags::bitflags;
 /// `Default` means "use the terminal's configured default", which the renderer
 /// resolves to concrete RGB at paint time. `Indexed` covers the ANSI 16-color
 /// palette (0-15) and the 256-color cube (16-255). `Rgb` is truecolor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Color {
     Default,
     Indexed(u8),
@@ -22,7 +22,7 @@ impl Default for Color {
 
 bitflags! {
     /// Per-cell text attributes. Matches the common SGR set we care about in v0.1.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
     pub struct Attrs: u8 {
         const BOLD      = 1 << 0;
         const DIM       = 1 << 1;
@@ -35,7 +35,7 @@ bitflags! {
 }
 
 /// One cell in the grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cell {
     pub ch: char,
     pub fg: Color,

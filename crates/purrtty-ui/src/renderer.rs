@@ -1,8 +1,12 @@
 //! wgpu + glyphon renderer.
 //!
-//! Renders a [`Grid`] as monochrome text on a dark background via
-//! glyphon. Color attributes and a blinking cursor land in M4 polish.
+//! Renders a [`Grid`] as text on a dark background. The grid is split
+//! into one cosmic-text `Buffer` per row; a frame-level dirty check
+//! re-shapes only the rows whose content actually changed since the
+//! previous frame. Colors and cursor are still pending (later M4 stages).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -10,7 +14,8 @@ use glyphon::{
     Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
-use purrtty_term::Grid;
+use purrtty_term::grid::WIDE_CONT;
+use purrtty_term::{Cell, Grid};
 use wgpu::{
     CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor, LoadOp, MultisampleState,
     Operations, PresentMode, RenderPassColorAttachment, RenderPassDescriptor,
@@ -23,7 +28,8 @@ const FONT_SIZE: f32 = 18.0;
 /// Line height in physical pixels (font size * ~1.22).
 const LINE_HEIGHT: f32 = 22.0;
 /// Approximate monospace advance width in physical pixels. Slightly over a
-/// half em for most monospace fonts at 18px.
+/// half em for most monospace fonts at 18px. Refined by measurement in a
+/// later stage.
 const CELL_WIDTH: f32 = 10.0;
 /// Inner window padding (physical pixels).
 const PAD_X: f32 = 16.0;
@@ -42,7 +48,16 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    buffer: Buffer,
+
+    /// One glyphon buffer per visible row. Rebuilt on resize.
+    row_buffers: Vec<Buffer>,
+    /// Cached content hash per row; a row is re-shaped only when its hash
+    /// changes between frames.
+    row_hashes: Vec<u64>,
+    /// Cached number of grid rows the `row_buffers` were sized for. Used to
+    /// detect a grid-dimension change between renders.
+    last_grid_rows: usize,
+    last_grid_cols: usize,
 }
 
 impl Renderer {
@@ -87,21 +102,13 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let mut font_system = FontSystem::new();
+        let font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-
-        let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-        // Terminals are column-oriented: one grid row = one visual line.
-        // Disable cosmic-text's soft-wrap so a row wider than the buffer
-        // just gets clipped instead of flowing into extra visual lines
-        // that would push the cursor off the bottom of the window.
-        buffer.set_wrap(&mut font_system, Wrap::None);
-        buffer.set_size(&mut font_system, Some(width as f32), Some(height as f32));
 
         Ok(Self {
             window,
@@ -114,7 +121,10 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
-            buffer,
+            row_buffers: Vec::new(),
+            row_hashes: Vec::new(),
+            last_grid_rows: 0,
+            last_grid_cols: 0,
         })
     }
 
@@ -134,11 +144,8 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.buffer.set_size(
-            &mut self.font_system,
-            Some(size.width as f32),
-            Some(size.height as f32),
-        );
+        // Row buffers are rebuilt lazily in render() when the grid
+        // dimensions actually change.
     }
 
     pub fn render(&mut self, grid: &Grid, scroll_offset: usize) -> Result<()> {
@@ -150,39 +157,83 @@ impl Renderer {
             },
         );
 
-        // Build the frame text by walking the visible view. Scroll offset
-        // pulls rows out of scrollback into the top of the view; 0 is the
-        // live bottom.
         let rows = grid.rows();
         let cols = grid.cols();
-        let mut text = String::with_capacity(rows * (cols + 1));
-        for view_idx in 0..rows {
-            if let Some(row) = grid.row_at(view_idx, scroll_offset) {
-                for cell in row {
-                    // Skip right-hand continuation cells of wide glyphs —
-                    // the wide char in the preceding cell already covers
-                    // that visual column.
-                    if cell.ch == purrtty_term::grid::WIDE_CONT {
-                        continue;
-                    }
-                    text.push(cell.ch);
-                }
+
+        // Rebuild row buffers if the grid dimensions changed.
+        if rows != self.last_grid_rows || cols != self.last_grid_cols {
+            self.row_buffers.clear();
+            self.row_hashes.clear();
+            self.row_buffers.reserve(rows);
+            self.row_hashes.reserve(rows);
+            for _ in 0..rows {
+                let mut buf = Buffer::new(
+                    &mut self.font_system,
+                    Metrics::new(FONT_SIZE, LINE_HEIGHT),
+                );
+                buf.set_wrap(&mut self.font_system, Wrap::None);
+                // One row's worth of horizontal space; vertical space just
+                // needs to be at least one line high.
+                buf.set_size(
+                    &mut self.font_system,
+                    Some(cols as f32 * CELL_WIDTH * 2.0),
+                    Some(LINE_HEIGHT * 2.0),
+                );
+                self.row_buffers.push(buf);
+                // Sentinel hash that guarantees first-frame update.
+                self.row_hashes.push(u64::MAX);
             }
-            text.push('\n');
-        }
-        // drop trailing newline so cosmic-text doesn't reserve an extra line
-        if text.ends_with('\n') {
-            text.pop();
+            self.last_grid_rows = rows;
+            self.last_grid_cols = cols;
         }
 
-        self.buffer.set_text(
-            &mut self.font_system,
-            &text,
-            Attrs::new().family(Family::Monospace),
-            Shaping::Advanced,
-        );
-        self.buffer
-            .shape_until_scroll(&mut self.font_system, false);
+        // Update dirty rows: for each visible row, compute its content hash
+        // and re-shape its buffer only when the hash changes.
+        for view_idx in 0..rows {
+            let row = grid.row_at(view_idx, scroll_offset).unwrap_or(&[]);
+            let hash = row_hash(row);
+            if self.row_hashes[view_idx] != hash {
+                let text: String = row
+                    .iter()
+                    .filter(|c| c.ch != WIDE_CONT)
+                    .map(|c| c.ch)
+                    .collect();
+                let buffer = &mut self.row_buffers[view_idx];
+                buffer.set_text(
+                    &mut self.font_system,
+                    &text,
+                    Attrs::new().family(Family::Monospace),
+                    Shaping::Advanced,
+                );
+                buffer.shape_until_scroll(&mut self.font_system, false);
+                self.row_hashes[view_idx] = hash;
+            }
+        }
+
+        // Collect a TextArea per row. Rows are positioned manually at
+        // `(PAD_X, PAD_Y + row * LINE_HEIGHT)` so rows are exactly aligned
+        // regardless of what cosmic-text does inside a single row.
+        let default_color = GlyphColor::rgb(220, 220, 220);
+        let bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: self.config.width as i32,
+            bottom: self.config.height as i32,
+        };
+        let text_areas: Vec<TextArea> = self
+            .row_buffers
+            .iter()
+            .enumerate()
+            .map(|(row_idx, buffer)| TextArea {
+                buffer,
+                left: PAD_X,
+                top: PAD_Y + row_idx as f32 * LINE_HEIGHT,
+                scale: 1.0,
+                bounds,
+                default_color,
+                custom_glyphs: &[],
+            })
+            .collect();
 
         self.text_renderer
             .prepare(
@@ -191,20 +242,7 @@ impl Renderer {
                 &mut self.font_system,
                 &mut self.atlas,
                 &self.viewport,
-                [TextArea {
-                    buffer: &self.buffer,
-                    left: PAD_X,
-                    top: PAD_Y,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: self.config.width as i32,
-                        bottom: self.config.height as i32,
-                    },
-                    default_color: GlyphColor::rgb(220, 220, 220),
-                    custom_glyphs: &[],
-                }],
+                text_areas,
                 &mut self.swash_cache,
             )
             .context("glyphon prepare")?;
@@ -249,7 +287,16 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         self.atlas.trim();
-        let _ = &self.window; // keep window reference live for surface 'static
+        let _ = &self.window;
         Ok(())
     }
+}
+
+/// Content hash for one grid row, including every cell's char/fg/bg/attrs.
+fn row_hash(row: &[Cell]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for cell in row {
+        cell.hash(&mut h);
+    }
+    h.finish()
 }
