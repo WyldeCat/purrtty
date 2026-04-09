@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod quad;
 mod renderer;
 
 pub use renderer::Renderer;

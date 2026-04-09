@@ -1,12 +1,12 @@
 //! wgpu + glyphon renderer.
 //!
-//! Renders a [`Grid`] using a single `cosmic_text::Buffer` shared across
-//! the whole grid. Per-line updates go through `buffer.lines[i].set_text`
-//! with an `AttrsList` carrying per-cell colors and attributes — this is
-//! the same pattern cosmic-term uses, and it lets cosmic-text's
-//! line-level shaping reuse what's already shaped from previous frames.
+//! Single `cosmic_text::Buffer` covering the whole grid (one BufferLine
+//! per row), per-line `set_text` for dirty rows only, and per-glyph
+//! foreground colors via `AttrsList`. Backgrounds, reverse video, and
+//! the cursor are drawn as solid wgpu quads on either side of the text
+//! pass via `QuadRenderer`.
 //!
-//! See `docs/perf.md` for the research that led here.
+//! See `docs/perf.md` for the design rationale.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -28,13 +28,28 @@ use wgpu::{
 };
 use winit::{dpi::PhysicalSize, window::Window};
 
+use crate::quad::{QuadRenderer, QuadVertex};
+
 const FONT_SIZE: f32 = 18.0;
 const LINE_HEIGHT: f32 = 22.0;
-const CELL_WIDTH: f32 = 10.0;
 const PAD_X: f32 = 16.0;
 const PAD_Y: f32 = 16.0;
 
 const DEFAULT_FG: GlyphColor = GlyphColor::rgb(220, 220, 220);
+/// Surface clear color, also used as the default background when reverse
+/// video needs an explicit color to swap into the foreground.
+const SURFACE_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0.05,
+    g: 0.05,
+    b: 0.08,
+    a: 1.0,
+};
+const DEFAULT_BG_RGBA: [f32; 4] = [
+    SURFACE_CLEAR.r as f32,
+    SURFACE_CLEAR.g as f32,
+    SURFACE_CLEAR.b as f32,
+    1.0,
+];
 
 /// Owns wgpu + glyphon state tied to a single window/surface.
 pub struct Renderer {
@@ -50,12 +65,14 @@ pub struct Renderer {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
 
-    /// Single buffer for the entire grid; we mutate `buffer.lines[i]` per
-    /// row instead of rebuilding it from scratch each frame.
+    quads: QuadRenderer,
+    /// Cell advance width measured from the active monospace font once
+    /// at startup. Used for both grid sizing and quad placement.
+    cell_width: f32,
+
+    /// Single buffer for the entire grid; per-line updates via
+    /// `buffer.lines[i].set_text`.
     buffer: Buffer,
-    /// Cached content hash per row, used as a fast pre-check before going
-    /// into cosmic-text. Avoids the per-frame allocation of building a
-    /// String + AttrsList for unchanged rows.
     row_hashes: Vec<u64>,
     last_grid_rows: usize,
     last_grid_cols: usize,
@@ -104,12 +121,17 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let mut font_system = FontSystem::new();
+        let cell_width = measure_cell_width(&mut font_system);
+        tracing::debug!(cell_width, "measured monospace cell width");
+
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+
+        let quads = QuadRenderer::new(&device, format)?;
 
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         buffer.set_wrap(&mut font_system, Wrap::None);
@@ -130,6 +152,8 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
+            quads,
+            cell_width,
             buffer,
             row_hashes: Vec::new(),
             last_grid_rows: 0,
@@ -141,7 +165,7 @@ impl Renderer {
     pub fn grid_dimensions(&self) -> (u16, u16) {
         let w = (self.config.width as f32 - 2.0 * PAD_X).max(0.0);
         let h = (self.config.height as f32 - 2.0 * PAD_Y).max(0.0);
-        let cols = (w / CELL_WIDTH).floor().max(1.0) as u16;
+        let cols = (w / self.cell_width).floor().max(1.0) as u16;
         let rows = (h / LINE_HEIGHT).floor().max(1.0) as u16;
         (rows, cols)
     }
@@ -171,9 +195,11 @@ impl Renderer {
 
         let rows = grid.rows();
         let cols = grid.cols();
+        let cell_w = self.cell_width;
+        let pad_x = PAD_X;
+        let pad_y = PAD_Y;
 
-        // On grid dimension change, reset the buffer's lines vec to exactly
-        // `rows` empty lines and invalidate all row hashes.
+        // Reset on dimension change.
         if rows != self.last_grid_rows || cols != self.last_grid_cols {
             self.buffer.lines.clear();
             for _ in 0..rows {
@@ -190,9 +216,7 @@ impl Renderer {
             self.last_grid_cols = cols;
         }
 
-        // For each visible row, hash and update only on change. cosmic-text
-        // tracks shaping per BufferLine internally, so untouched lines
-        // don't get re-shaped.
+        // ---- text: per-line set_text on dirty rows ----
         for view_idx in 0..rows {
             let row = grid.row_at(view_idx, scroll_offset).unwrap_or(&[]);
             let hash = row_hash(row);
@@ -203,10 +227,62 @@ impl Renderer {
             self.buffer.lines[view_idx].set_text(text, LineEnding::default(), attrs_list);
             self.row_hashes[view_idx] = hash;
         }
-
         self.buffer
             .shape_until_scroll(&mut self.font_system, false);
 
+        // ---- background quads ----
+        let mut bg_verts: Vec<QuadVertex> = Vec::new();
+        for view_idx in 0..rows {
+            let row = grid.row_at(view_idx, scroll_offset).unwrap_or(&[]);
+            for (col_idx, cell) in row.iter().enumerate() {
+                if col_idx >= cols {
+                    break;
+                }
+                if cell.ch == WIDE_CONT {
+                    continue;
+                }
+                let (_fg, bg_opt) = cell_colors(cell);
+                let Some(bg) = bg_opt else { continue };
+                let next_is_cont = col_idx + 1 < cols
+                    && row
+                        .get(col_idx + 1)
+                        .map(|c| c.ch == WIDE_CONT)
+                        .unwrap_or(false);
+                let w = if next_is_cont { 2.0 * cell_w } else { cell_w };
+                let x = pad_x + col_idx as f32 * cell_w;
+                let y = pad_y + view_idx as f32 * LINE_HEIGHT;
+                QuadRenderer::push_rect(&mut bg_verts, x, y, w, LINE_HEIGHT, bg);
+            }
+        }
+
+        // ---- cursor quad (overlay) ----
+        let mut overlay_verts: Vec<QuadVertex> = Vec::new();
+        if grid.cursor_visible() && scroll_offset == 0 {
+            let cursor = grid.cursor();
+            if cursor.row < rows && cols > 0 {
+                let col = cursor.col.min(cols - 1);
+                let x = pad_x + col as f32 * cell_w;
+                let y = pad_y + cursor.row as f32 * LINE_HEIGHT;
+                // Hollow / alpha-blended block — text remains visible.
+                QuadRenderer::push_rect(
+                    &mut overlay_verts,
+                    x,
+                    y,
+                    cell_w,
+                    LINE_HEIGHT,
+                    [0.85, 0.85, 0.85, 0.4],
+                );
+            }
+        }
+
+        self.quads
+            .update_resolution(&self.queue, self.config.width, self.config.height);
+        self.quads
+            .upload_bg(&self.device, &self.queue, &bg_verts);
+        self.quads
+            .upload_overlay(&self.device, &self.queue, &overlay_verts);
+
+        // ---- glyphon prepare ----
         let bounds = TextBounds {
             left: 0,
             top: 0,
@@ -215,8 +291,8 @@ impl Renderer {
         };
         let text_area = TextArea {
             buffer: &self.buffer,
-            left: PAD_X,
-            top: PAD_Y,
+            left: pad_x,
+            top: pad_y,
             scale: 1.0,
             bounds,
             default_color: DEFAULT_FG,
@@ -235,6 +311,7 @@ impl Renderer {
             )
             .context("glyphon prepare")?;
 
+        // ---- render pass: clear → bg quads → text → overlay quads ----
         let frame = self
             .surface
             .get_current_texture()
@@ -253,12 +330,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Clear(SURFACE_CLEAR),
                         store: StoreOp::Store,
                     },
                 })],
@@ -267,9 +339,11 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
+            self.quads.render_bg(&mut pass);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .context("glyphon render")?;
+            self.quads.render_overlay(&mut pass);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -284,22 +358,62 @@ fn default_attrs() -> Attrs<'static> {
     Attrs::new().family(Family::Monospace)
 }
 
+/// Measure the advance width of an `M` glyph in the active monospace
+/// font. Falls back to a font-size estimate if shaping returns nothing.
+fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
+    let mut buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    buf.set_wrap(font_system, Wrap::None);
+    buf.set_size(font_system, Some(2000.0), Some(LINE_HEIGHT * 4.0));
+    buf.set_text(
+        font_system,
+        "MMMMMMMMMM",
+        Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+    );
+    buf.shape_until_scroll(font_system, false);
+
+    let mut max_x: f32 = 0.0;
+    if let Some(run) = buf.layout_runs().next() {
+        for glyph in run.glyphs.iter() {
+            let right = glyph.x + glyph.w;
+            if right > max_x {
+                max_x = right;
+            }
+        }
+        if max_x > 0.0 {
+            return max_x / 10.0;
+        }
+    }
+    FONT_SIZE * 0.6
+}
+
 /// Build the cosmic-text line text and the matching `AttrsList` from a
-/// grid row. Cells with identical fg/attrs are compacted into one span.
+/// grid row. Cells with identical effective fg/attrs (after reverse-video
+/// resolution) are compacted into one span.
 fn build_line(row: &[Cell]) -> (String, AttrsList) {
     let mut attrs_list = AttrsList::new(default_attrs());
     let mut text = String::with_capacity(row.len());
 
     let mut run_start: Option<usize> = None;
-    let mut run_fg = TermColor::Default;
+    let mut run_fg = DEFAULT_FG;
     let mut run_attrs = CellAttrs::empty();
 
     for cell in row {
         if cell.ch == WIDE_CONT {
             continue;
         }
+        let (fg, _bg) = cell_colors(cell);
+        // Drop REVERSE from the per-glyph attrs since we already swapped
+        // colors and bold/italic still apply.
+        let effective_attrs = cell.attrs & !CellAttrs::REVERSE;
         let started_new_run = match run_start {
-            Some(_) => cell.fg != run_fg || cell.attrs != run_attrs,
+            Some(_) => {
+                fg.r() != run_fg.r()
+                    || fg.g() != run_fg.g()
+                    || fg.b() != run_fg.b()
+                    || fg.a() != run_fg.a()
+                    || effective_attrs != run_attrs
+            }
             None => true,
         };
         if started_new_run {
@@ -309,8 +423,8 @@ fn build_line(row: &[Cell]) -> (String, AttrsList) {
                 }
             }
             run_start = Some(text.len());
-            run_fg = cell.fg;
-            run_attrs = cell.attrs;
+            run_fg = fg;
+            run_attrs = effective_attrs;
         }
         text.push(cell.ch);
     }
@@ -323,16 +437,34 @@ fn build_line(row: &[Cell]) -> (String, AttrsList) {
     (text, attrs_list)
 }
 
-/// Convert a terminal cell's foreground + attrs into a cosmic-text Attrs
-/// suitable for an `AttrsList` span. Background colors and reverse-video
-/// will be a separate wgpu quad pass in the next stage.
-fn make_attrs(fg: TermColor, attrs: CellAttrs) -> Attrs<'static> {
-    use glyphon::cosmic_text::{Style, Weight};
+/// Return the foreground glyph color and (optionally) a background quad
+/// color for a cell, applying reverse-video swap.
+fn cell_colors(cell: &Cell) -> (GlyphColor, Option<[f32; 4]>) {
+    let fg = resolve_color(cell.fg, DEFAULT_FG);
+    let bg_opt = match cell.bg {
+        TermColor::Default => None,
+        other => Some(resolve_color(other, DEFAULT_FG)),
+    };
 
-    let mut a = default_attrs();
-    if let Some(color) = term_color_to_glyph(fg) {
-        a = a.color(color);
+    if cell.attrs.contains(CellAttrs::REVERSE) {
+        // Swap. A "default" background becomes the surface clear color.
+        let new_fg_glyph = bg_opt.unwrap_or_else(|| {
+            GlyphColor::rgb(
+                (DEFAULT_BG_RGBA[0] * 255.0) as u8,
+                (DEFAULT_BG_RGBA[1] * 255.0) as u8,
+                (DEFAULT_BG_RGBA[2] * 255.0) as u8,
+            )
+        });
+        let new_bg_rgba = glyph_to_rgba(fg);
+        return (new_fg_glyph, Some(new_bg_rgba));
     }
+
+    (fg, bg_opt.map(glyph_to_rgba))
+}
+
+fn make_attrs(fg: GlyphColor, attrs: CellAttrs) -> Attrs<'static> {
+    use glyphon::cosmic_text::{Style, Weight};
+    let mut a = default_attrs().color(fg);
     if attrs.contains(CellAttrs::BOLD) {
         a = a.weight(Weight::BOLD);
     }
@@ -342,40 +474,48 @@ fn make_attrs(fg: TermColor, attrs: CellAttrs) -> Attrs<'static> {
     a
 }
 
-fn term_color_to_glyph(c: TermColor) -> Option<GlyphColor> {
+fn resolve_color(c: TermColor, default: GlyphColor) -> GlyphColor {
     match c {
-        TermColor::Default => None,
-        TermColor::Indexed(i) => Some(indexed_color(i)),
-        TermColor::Rgb(r, g, b) => Some(GlyphColor::rgb(r, g, b)),
+        TermColor::Default => default,
+        TermColor::Indexed(i) => indexed_color(i),
+        TermColor::Rgb(r, g, b) => GlyphColor::rgb(r, g, b),
     }
+}
+
+fn glyph_to_rgba(c: GlyphColor) -> [f32; 4] {
+    [
+        c.r() as f32 / 255.0,
+        c.g() as f32 / 255.0,
+        c.b() as f32 / 255.0,
+        c.a() as f32 / 255.0,
+    ]
 }
 
 /// 16-color ANSI palette + xterm 256-color cube + grayscale ramp.
 fn indexed_color(i: u8) -> GlyphColor {
     const ANSI_16: [(u8, u8, u8); 16] = [
-        (0, 0, 0),       // black
-        (205, 49, 49),   // red
-        (13, 188, 121),  // green
-        (229, 229, 16),  // yellow
-        (36, 114, 200),  // blue
-        (188, 63, 188),  // magenta
-        (17, 168, 205),  // cyan
-        (229, 229, 229), // white (light gray)
-        (102, 102, 102), // bright black (dark gray)
-        (241, 76, 76),   // bright red
-        (35, 209, 139),  // bright green
-        (245, 245, 67),  // bright yellow
-        (59, 142, 234),  // bright blue
-        (214, 112, 214), // bright magenta
-        (41, 184, 219),  // bright cyan
-        (255, 255, 255), // bright white
+        (0, 0, 0),
+        (205, 49, 49),
+        (13, 188, 121),
+        (229, 229, 16),
+        (36, 114, 200),
+        (188, 63, 188),
+        (17, 168, 205),
+        (229, 229, 229),
+        (102, 102, 102),
+        (241, 76, 76),
+        (35, 209, 139),
+        (245, 245, 67),
+        (59, 142, 234),
+        (214, 112, 214),
+        (41, 184, 219),
+        (255, 255, 255),
     ];
     if (i as usize) < ANSI_16.len() {
         let (r, g, b) = ANSI_16[i as usize];
         return GlyphColor::rgb(r, g, b);
     }
     if i >= 16 && i <= 231 {
-        // 6×6×6 color cube
         let n = i - 16;
         let r = n / 36;
         let g = (n % 36) / 6;
@@ -389,12 +529,10 @@ fn indexed_color(i: u8) -> GlyphColor {
         };
         return GlyphColor::rgb(lvl(r), lvl(g), lvl(b));
     }
-    // 232..=255 grayscale ramp
     let g = 8 + (i - 232) * 10;
     GlyphColor::rgb(g, g, g)
 }
 
-/// Content hash for one grid row, including every cell's char/fg/bg/attrs.
 fn row_hash(row: &[Cell]) -> u64 {
     let mut h = DefaultHasher::new();
     for cell in row {

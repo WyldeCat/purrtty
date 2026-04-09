@@ -15,3 +15,4 @@ winit = { workspace = true }
 wgpu = "22"
 glyphon = "0.6"
 pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
