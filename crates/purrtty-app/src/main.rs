@@ -189,27 +189,37 @@ impl PurrttyApp {
             return;
         }
 
-        // Backspace → remove last char from buffer + visual erase.
+        // Backspace → remove last char from buffer.
         if event.logical_key == Key::Named(NamedKey::Backspace) {
             if let InputMode::AgentInput { buffer } = &mut self.input_mode {
                 if buffer.pop().is_some() {
-                    self.echo_to_terminal(b"\x08 \x08");
+                    let snap = buffer.clone();
+                    self.refresh_agent_line(&snap);
                     self.redraw();
                 }
             }
             return;
         }
 
-        // Printable text → append to buffer + echo.
+        // Printable text → append to buffer.
         if let Some(text) = &event.text {
             if !text.is_empty() {
                 if let InputMode::AgentInput { buffer } = &mut self.input_mode {
                     buffer.push_str(text.as_str());
-                    self.echo_to_terminal(text.as_bytes());
+                    let snap = buffer.clone();
+                    self.refresh_agent_line(&snap);
                     self.redraw();
                 }
             }
         }
+    }
+
+    /// Redraw the entire agent input line from scratch. Avoids the
+    /// `\x08 \x08` single-char erase which can leave rendering artifacts
+    /// with certain fonts or multi-byte characters.
+    fn refresh_agent_line(&self, buffer: &str) {
+        let line = format!("\r\x1b[2K\x1b[1;36m> \x1b[0m{}", buffer);
+        self.echo_to_terminal(line.as_bytes());
     }
 
     fn echo_to_terminal(&self, bytes: &[u8]) {
