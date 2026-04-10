@@ -118,6 +118,10 @@ pub struct GlyphCache {
 }
 
 impl GlyphCache {
+    pub fn font_size(&self) -> f32 {
+        self.font_size
+    }
+
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

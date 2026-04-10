@@ -110,6 +110,32 @@ impl PurrttyApp {
         }
     }
 
+    fn zoom_font(&mut self, delta: f32) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let Some((rows, cols)) = renderer.change_font_size(delta) else { return };
+        info!(rows, cols, delta, "font size changed");
+        if let Some(terminal) = self.terminal.as_ref() {
+            if let Ok(mut term) = terminal.lock() {
+                term.grid_mut().resize(rows as usize, cols as usize);
+            }
+        }
+        if let Some(pty) = self.pty.as_ref() {
+            if let Err(err) = pty.resize(rows, cols) {
+                warn!(?err, "pty resize failed after font zoom");
+            }
+        }
+        self.redraw();
+    }
+
+    fn zoom_font_reset(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let cur = renderer.current_font_size();
+        let default = self.config.font.size;
+        let delta = default - cur;
+        if delta.abs() < 0.1 { return; }
+        self.zoom_font(delta);
+    }
+
     fn handle_keyboard_input(&mut self, event: &KeyEvent) {
         match &mut self.input_mode {
             InputMode::Normal => self.handle_normal_input(event),
@@ -513,6 +539,19 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Ctrl+= (zoom in) / Ctrl+- (zoom out) / Ctrl+0 (reset).
+                if (self.modifiers.control_key() || self.modifiers.super_key())
+                    && event.state == ElementState::Pressed
+                {
+                    if let Key::Character(s) = &event.logical_key {
+                        match s.as_str() {
+                            "=" | "+" => { self.zoom_font(2.0); return; }
+                            "-" => { self.zoom_font(-2.0); return; }
+                            "0" => { self.zoom_font_reset(); return; }
+                            _ => {}
+                        }
+                    }
+                }
                 self.handle_keyboard_input(&event);
             }
             WindowEvent::MouseWheel { delta, .. } => {
