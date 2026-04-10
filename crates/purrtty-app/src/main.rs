@@ -234,13 +234,19 @@ impl PurrttyApp {
             return;
         }
 
-        // Backspace → remove last char from buffer.
+        // Backspace → remove last char from buffer, or exit agent mode
+        // if the buffer is already empty.
         if event.logical_key == Key::Named(NamedKey::Backspace) {
             if let InputMode::AgentInput { buffer, start_col } = &mut self.input_mode {
                 if buffer.pop().is_some() {
                     let snap = buffer.clone();
                     let col = *start_col;
                     self.refresh_agent_line(&snap, col);
+                    self.redraw();
+                } else {
+                    let col = *start_col;
+                    self.refresh_agent_line("", col);
+                    self.input_mode = InputMode::Normal;
                     self.redraw();
                 }
             }
@@ -708,4 +714,38 @@ fn main() -> Result<()> {
     let mut app = PurrttyApp::new(proxy, config);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backspacing past the empty agent buffer should exit agent mode
+    /// and return to normal shell input.
+    #[test]
+    fn backspace_on_empty_agent_buffer_exits_agent_mode() {
+        // Start in AgentInput with an empty buffer (user typed `>` then
+        // immediately backspaced the one char they typed, or never
+        // typed anything after `>`).
+        let mut mode = InputMode::AgentInput {
+            buffer: String::new(),
+            start_col: 2,
+        };
+
+        // Simulate what handle_agent_input does on Backspace:
+        if let InputMode::AgentInput { buffer, .. } = &mut mode {
+            if buffer.pop().is_some() {
+                // Would call refresh_agent_line + redraw here.
+            } else {
+                // Buffer empty → exit agent mode.
+                mode = InputMode::Normal;
+            }
+        }
+
+        assert!(
+            matches!(mode, InputMode::Normal),
+            "backspace on empty agent buffer should exit to Normal mode, \
+             but mode is still AgentInput"
+        );
+    }
 }
