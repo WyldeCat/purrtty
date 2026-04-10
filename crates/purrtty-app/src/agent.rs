@@ -130,78 +130,71 @@ fn format_event(json: &Value) -> Option<String> {
     let event_type = json.get("type")?.as_str()?;
 
     match event_type {
-        // Text streaming: `.event.delta.type == "text_delta"`
         "stream_event" => {
             let event = json.get("event")?;
+            let event_kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-            // Text delta — the main content stream.
-            if let Some(delta) = event.get("delta") {
-                if delta.get("type").and_then(|t| t.as_str()) == Some("text_delta") {
-                    return delta.get("text").and_then(|t| t.as_str()).map(String::from);
+            match event_kind {
+                // Text delta — the main content stream. Rendered as-is.
+                "content_block_delta" => {
+                    let delta = event.get("delta")?;
+                    let delta_type = delta.get("type").and_then(|t| t.as_str())?;
+                    match delta_type {
+                        "text_delta" => {
+                            delta.get("text").and_then(|t| t.as_str()).map(String::from)
+                        }
+                        // Tool input streaming — show in dim.
+                        "input_json_delta" => {
+                            delta
+                                .get("partial_json")
+                                .and_then(|p| p.as_str())
+                                .map(|s| format!("\x1b[2m{}\x1b[0m", s))
+                        }
+                        _ => None,
+                    }
                 }
-            }
 
-            // Content block start — detect tool use.
-            if event.get("type").and_then(|t| t.as_str()) == Some("content_block_start") {
-                if let Some(block) = event.get("content_block") {
+                // New content block — detect tool use start.
+                "content_block_start" => {
+                    let block = event.get("content_block")?;
                     if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         let tool_name = block
                             .get("name")
                             .and_then(|n| n.as_str())
                             .unwrap_or("tool");
-                        return Some(format!(
-                            "\r\n\x1b[1;33m⚡ {}\x1b[0m ",
-                            tool_name
-                        ));
+                        Some(format!("\r\n\x1b[1;33m⚡ {}\x1b[0m ", tool_name))
+                    } else {
+                        None
                     }
                 }
-            }
 
-            // Input JSON delta for tool use — show what's being passed.
-            if delta_is_input_json(event) {
-                if let Some(partial) = event
-                    .get("delta")
-                    .and_then(|d| d.get("partial_json"))
-                    .and_then(|p| p.as_str())
-                {
-                    return Some(format!("\x1b[2m{}\x1b[0m", partial));
+                // End of a tool_use block — add a newline so the next
+                // text or tool starts on a fresh line.
+                "content_block_stop" => {
+                    // Only emit newline; text blocks end naturally with
+                    // their own content. A single \n is enough separation.
+                    Some("\r\n".to_string())
                 }
-            }
 
-            // Content block stop after tool use — newline.
-            if event.get("type").and_then(|t| t.as_str()) == Some("content_block_stop") {
-                return Some("\r\n".to_string());
+                _ => None,
             }
-
-            None
         }
 
-        // Result message — final output. Text was already streamed via
-        // deltas, so we just add a trailing newline if needed.
-        "result" => Some("\r\n".to_string()),
-
-        // System init — log session ID.
+        // System init — log session ID for --resume support later.
         "system" => {
-            if json.get("subtype").and_then(|s| s.as_str()) == Some("init") {
-                if let Some(sid) = json
-                    .get("data")
-                    .and_then(|d| d.get("session_id"))
-                    .and_then(|s| s.as_str())
-                {
+            let subtype = json.get("subtype").and_then(|s| s.as_str())?;
+            if subtype == "init" {
+                if let Some(sid) = json.get("session_id").and_then(|s| s.as_str()) {
                     debug!(session_id = sid, "agent session started");
                 }
             }
             None
         }
 
+        // Result — text was already streamed. Skip to avoid extra blank
+        // lines.
+        "result" | "assistant" | "rate_limit_event" => None,
+
         _ => None,
     }
-}
-
-fn delta_is_input_json(event: &Value) -> bool {
-    event
-        .get("delta")
-        .and_then(|d| d.get("type"))
-        .and_then(|t| t.as_str())
-        == Some("input_json_delta")
 }
