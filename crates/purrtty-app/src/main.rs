@@ -36,6 +36,10 @@ enum UserEvent {
     PtyDataArrived,
     /// The Claude agent process exited.
     AgentFinished { exit_code: i32 },
+    /// Deferred redraw — fires ~500ms after startup to ensure the prompt
+    /// is rendered even if early frames were discarded by macOS before
+    /// the CAMetalLayer was presentable.
+    DeferredRedraw,
 }
 
 /// Keyboard input routing state.
@@ -371,6 +375,20 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
         self.pty = Some(pty);
         self.terminal = Some(terminal);
         window.request_redraw();
+
+        // Schedule a deferred redraw so the prompt is visible even if
+        // macOS discards early frames before the surface is presentable.
+        let proxy_for_deferred = self
+            .proxy
+            .clone()
+            .expect("proxy set before ApplicationHandler::resumed");
+        std::thread::Builder::new()
+            .name("purrtty-deferred-redraw".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = proxy_for_deferred.send_event(UserEvent::DeferredRedraw);
+            })
+            .ok();
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -392,6 +410,9 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                         let _ = pty.write(&resp);
                     }
                 }
+                self.redraw();
+            }
+            UserEvent::DeferredRedraw => {
                 self.redraw();
             }
             UserEvent::AgentFinished { exit_code } => {

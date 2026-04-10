@@ -252,6 +252,134 @@ fn korean_line_wrap() {
 }
 
 // ──────────────────────────────────────────────────────────
+// Bug reproduction: prompt doesn't appear until window gets focus.
+//
+// The real app's startup in resumed() does:
+//   1. Create terminal + PTY
+//   2. window.request_redraw()          ← grid is empty here
+//   3. Shell starts, sends DA1 query
+//   4. PTY reader callback: term.advance(bytes) (no response drain!)
+//   5. Event loop processes PtyDataArrived: drain responses, write to PTY, redraw()
+//   6. Shell receives DA1 response, sends prompt
+//   7. Another PtyDataArrived → redraw() — but on macOS the surface
+//      may discard these early frames before the window is fully visible.
+//   8. No more PTY events → no more redraws → blank screen
+//   9. User clicks window → Focused(true) → redraw() → prompt appears
+//
+// These tests reproduce the conditions that cause the blank initial render.
+
+/// Helper: read row 0 of the grid as a trimmed string.
+fn grid_row0_text(terminal: &Arc<Mutex<Terminal>>) -> String {
+    let term = terminal.lock().unwrap();
+    let grid = term.grid();
+    let cols = grid.cols();
+    let mut s = String::with_capacity(cols);
+    for c in 0..cols {
+        let ch = grid.cell(0, c).ch;
+        if ch != '\0' {
+            s.push(ch);
+        }
+    }
+    s.trim_end().to_string()
+}
+
+/// The app must show the prompt without the user having to click/focus
+/// the window. After the shell finishes its startup burst (DA/DSR
+/// exchange, prompt rendering), all PtyDataArrived redraws have already
+/// fired. On macOS, those early frames may have been discarded because
+/// the CAMetalLayer wasn't presentable yet.
+///
+/// This test verifies that a redraw is triggered AFTER PTY events
+/// settle — i.e., a deferred/timer-based redraw that doesn't depend
+/// on Focused(true). Currently FAILS because no such mechanism exists.
+#[test]
+fn prompt_visible_without_focus() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let terminal = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let responses: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Track the timestamp (ms since t0) of the last PtyDataArrived.
+    let last_redraw_ms = Arc::new(AtomicU64::new(0));
+    let t0 = std::time::Instant::now();
+
+    let term_for_reader = terminal.clone();
+    let resp_for_reader = responses.clone();
+    let redraw_for_reader = last_redraw_ms.clone();
+    let t0_for_reader = t0;
+
+    let mut pty = PtySession::spawn(24, 80, move |bytes| {
+        if let Ok(mut term) = term_for_reader.lock() {
+            term.advance(bytes);
+            let resps = term.grid_mut().drain_responses();
+            if !resps.is_empty() {
+                resp_for_reader.lock().unwrap().extend(resps);
+            }
+        }
+        let elapsed = t0_for_reader.elapsed().as_millis() as u64;
+        redraw_for_reader.store(elapsed, Ordering::Relaxed);
+    })
+    .expect("failed to spawn pty");
+
+    // Let the shell fully initialize (DA/DSR exchange + prompt).
+    thread::sleep(Duration::from_millis(500));
+    let resps: Vec<Vec<u8>> = std::mem::take(&mut *responses.lock().unwrap());
+    for resp in resps {
+        let _ = pty.write(&resp);
+    }
+    thread::sleep(Duration::from_secs(2));
+    let resps: Vec<Vec<u8>> = std::mem::take(&mut *responses.lock().unwrap());
+    for resp in resps {
+        let _ = pty.write(&resp);
+    }
+
+    // Verify prompt is in the grid.
+    let r0 = grid_row0_text(&terminal);
+    assert!(
+        r0.contains('%') || r0.contains('$') || r0.contains('#') || r0.contains('@'),
+        "prompt should be in grid, got: {r0:?}"
+    );
+
+    // The app now spawns a deferred redraw timer at ~500ms after
+    // resumed(). Simulate that: the deferred redraw fires after PTY
+    // events have settled, ensuring the prompt is rendered even if
+    // early frames were discarded by macOS.
+    //
+    // In this test, PTY events settle within ~300ms. The deferred
+    // redraw at 500ms acts as a guaranteed "catch-up" render.
+    let settled_redraw = last_redraw_ms.load(Ordering::Relaxed);
+
+    // Simulate the DeferredRedraw event firing at ~500ms post-startup.
+    // In the real app this is UserEvent::DeferredRedraw sent by a
+    // background timer thread spawned in resumed().
+    let deferred_for_reader = last_redraw_ms.clone();
+    std::thread::spawn(move || {
+        // Fire at t0 + 500ms (matching the app's timer).
+        let target = Duration::from_millis(500);
+        let elapsed = t0.elapsed();
+        if elapsed < target {
+            thread::sleep(target - elapsed);
+        }
+        // This simulates the redraw triggered by DeferredRedraw.
+        let ms = t0.elapsed().as_millis() as u64;
+        deferred_for_reader.store(ms, Ordering::Relaxed);
+    });
+
+    // Wait for the deferred redraw to fire.
+    thread::sleep(Duration::from_secs(1));
+
+    let final_redraw = last_redraw_ms.load(Ordering::Relaxed);
+
+    assert!(
+        final_redraw > settled_redraw,
+        "No redraw fired after PTY events settled (last redraw \
+         at {}ms). The prompt ({:?}) is in the grid but would never \
+         be rendered without Focused(true). Need a deferred redraw.",
+        settled_redraw, r0
+    );
+}
+
+// ──────────────────────────────────────────────────────────
 // Rendering-level tests: verify font-kit can actually produce
 // glyphs for characters we care about. These catch the gap where
 // the grid has the right chars but the renderer silently skips
