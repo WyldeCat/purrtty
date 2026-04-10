@@ -94,6 +94,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 
 pub struct GlyphCache {
     font: Font,
+    /// Fallback fonts tried when the primary font lacks a glyph (CJK, emoji, etc.)
+    fallback_fonts: Vec<Font>,
     font_size: f32,
 
     atlas_texture: wgpu::Texture,
@@ -139,11 +141,34 @@ impl GlyphCache {
         let ascent = fk_metrics.ascent * scale;
         let cell_width = Self::measure_advance(&font, font_size);
 
+        // Load fallback fonts for glyphs missing from the primary (CJK, emoji, etc.)
+        let fallback_names = [
+            "Apple SD Gothic Neo",  // Korean
+            "PingFang SC",          // Chinese Simplified
+            "Hiragino Sans",        // Japanese
+            "Apple Color Emoji",    // Emoji
+            "Arial Unicode MS",     // Broad Unicode coverage
+        ];
+        let mut fallback_fonts = Vec::new();
+        let source = SystemSource::new();
+        for name in &fallback_names {
+            if let Ok(handle) = source.select_best_match(
+                &[FamilyName::Title(name.to_string())],
+                &Properties::new(),
+            ) {
+                if let Ok(f) = handle.load() {
+                    tracing::debug!(fallback = name, "loaded fallback font");
+                    fallback_fonts.push(f);
+                }
+            }
+        }
+
         tracing::debug!(
             cell_width,
             ascent,
             line_height,
             font_name = ?font.full_name(),
+            fallbacks = fallback_fonts.len(),
             "glyph cache initialized"
         );
 
@@ -299,6 +324,7 @@ impl GlyphCache {
 
         Ok(Self {
             font,
+            fallback_fonts,
             font_size,
             atlas_texture,
             atlas_view,
@@ -343,22 +369,31 @@ impl GlyphCache {
         if ch == ' ' || ch == '\0' {
             return None;
         }
-        self.rasterize_and_upload(ch, device, queue)
+        // Try primary font first, then each fallback.
+        if let Some(entry) = self.rasterize_with_font(&self.font.clone(), ch, queue) {
+            return Some(entry);
+        }
+        for i in 0..self.fallback_fonts.len() {
+            let font = self.fallback_fonts[i].clone();
+            if let Some(entry) = self.rasterize_with_font(&font, ch, queue) {
+                return Some(entry);
+            }
+        }
+        None
     }
 
-    fn rasterize_and_upload(
+    fn rasterize_with_font(
         &mut self,
+        font: &Font,
         ch: char,
-        _device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Option<GlyphEntry> {
-        let glyph_id = self.font.glyph_for_char(ch)?;
+        let glyph_id = font.glyph_for_char(ch)?;
 
         let hinting = HintingOptions::Full(self.font_size);
         let raster_opts = RasterizationOptions::GrayscaleAa;
 
-        let bounds = self
-            .font
+        let bounds = font
             .raster_bounds(
                 glyph_id,
                 self.font_size,
@@ -388,8 +423,7 @@ impl GlyphCache {
         let origin = bounds.origin();
         let transform = Transform2F::from_translation(-origin.to_f32());
         let mut canvas = Canvas::new(Vector2I::new(w as i32, h as i32), Format::A8);
-        self.font
-            .rasterize_glyph(
+        font.rasterize_glyph(
                 &mut canvas,
                 glyph_id,
                 self.font_size,

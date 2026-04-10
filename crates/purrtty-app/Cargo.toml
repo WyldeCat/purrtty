@@ -38,3 +38,6 @@ long_description  = "A Warp-inspired, GPU-accelerated terminal emulator for macO
 category          = "DeveloperTool"
 copyright         = "Copyright (c) 2026 WyldeCat"
 osx_minimum_system_version = "12.0"
+
+[dev-dependencies]
+font-kit = "0.14"

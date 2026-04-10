@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use font_kit::family_name::FamilyName;
+use font_kit::properties::Properties;
+use font_kit::source::SystemSource;
 use purrtty_pty::PtySession;
 use purrtty_term::Terminal;
 
@@ -246,4 +249,78 @@ fn korean_line_wrap() {
     // "글" wrapped to row 1
     assert_eq!(terminal.grid().cell(1, 0).ch, '글');
     assert_eq!(terminal.grid().cell(1, 1).ch, '\0'); // WIDE_CONT
+}
+
+// ──────────────────────────────────────────────────────────
+// Rendering-level tests: verify font-kit can actually produce
+// glyphs for characters we care about. These catch the gap where
+// the grid has the right chars but the renderer silently skips
+// them because the font lacks coverage.
+
+#[test]
+fn font_has_ascii_glyphs() {
+    let font = load_monospace_font();
+    for ch in "abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()".chars() {
+        assert!(
+            font.glyph_for_char(ch).is_some(),
+            "monospace font missing glyph for ASCII '{ch}'"
+        );
+    }
+}
+
+#[test]
+fn font_has_korean_glyphs_via_fallback() {
+    // The primary monospace font likely lacks Korean glyphs.
+    // Verify that at least ONE font (primary or fallback) covers them.
+    let fonts = load_fonts_with_fallbacks();
+    for ch in "한글안녕하세요".chars() {
+        let found = fonts.iter().any(|f| f.glyph_for_char(ch).is_some());
+        assert!(
+            found,
+            "no font (primary + fallbacks) has glyph for Korean '{ch}'"
+        );
+    }
+}
+
+#[test]
+fn font_has_common_symbols() {
+    let fonts = load_fonts_with_fallbacks();
+    for ch in "→←↑↓│─├┤┬┴┼█▓░".chars() {
+        let found = fonts.iter().any(|f| f.glyph_for_char(ch).is_some());
+        assert!(
+            found,
+            "no font has glyph for symbol '{ch}' (U+{:04X})",
+            ch as u32
+        );
+    }
+}
+
+fn load_monospace_font() -> font_kit::font::Font {
+    SystemSource::new()
+        .select_best_match(&[FamilyName::Monospace], &Properties::new())
+        .expect("no monospace font found")
+        .load()
+        .expect("failed to load monospace font")
+}
+
+fn load_fonts_with_fallbacks() -> Vec<font_kit::font::Font> {
+    let mut fonts = vec![load_monospace_font()];
+    let source = SystemSource::new();
+    let fallback_names = [
+        "Apple SD Gothic Neo",
+        "PingFang SC",
+        "Hiragino Sans",
+        "Arial Unicode MS",
+    ];
+    for name in &fallback_names {
+        if let Ok(handle) = source.select_best_match(
+            &[FamilyName::Title(name.to_string())],
+            &Properties::new(),
+        ) {
+            if let Ok(f) = handle.load() {
+                fonts.push(f);
+            }
+        }
+    }
+    fonts
 }
