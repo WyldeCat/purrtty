@@ -141,7 +141,12 @@ fn format_event(json: &Value) -> Option<String> {
                     let delta_type = delta.get("type").and_then(|t| t.as_str())?;
                     match delta_type {
                         "text_delta" => {
-                            delta.get("text").and_then(|t| t.as_str()).map(String::from)
+                            // Claude emits bare \n; terminals need \r\n
+                            // to return the cursor to column 0.
+                            delta
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.replace('\n', "\r\n"))
                         }
                         // Tool input streaming — show in dim.
                         "input_json_delta" => {
