@@ -207,42 +207,31 @@ impl PurrttyApp {
 
     /// Open a new tab with a fresh shell and switch to it.
     fn new_tab(&mut self) {
+        // Grab dimensions BEFORE we change the tab count — new tab
+        // will trigger a grid size update via sync_tab_info_and_resize.
         let Some(renderer) = self.renderer.as_ref() else { return };
         let (rows, cols) = renderer.grid_dimensions();
         let Some(new_session) = self.spawn_session(rows, cols) else { return };
-        // Snapshot current tab state before switching away.
         self.save_active_tab_state();
         self.sessions.push(new_session);
         self.active = self.sessions.len() - 1;
-        // Restore (empty defaults) state for the new tab.
         self.restore_active_tab_state();
+        self.sync_tab_info_and_resize();
         self.redraw();
     }
 
-    /// Close the active tab. If it's the last one, exit the app.
+    /// Close the active tab. If it's the last one, do nothing —
+    /// CloseRequested on the window is how the user exits the app.
     fn close_tab(&mut self) {
-        if self.sessions.is_empty() {
+        if self.sessions.len() <= 1 {
             return;
         }
         self.sessions.remove(self.active);
-        if self.sessions.is_empty() {
-            // Last tab closed — request app exit via the window.
-            if let Some(window) = self.window.as_ref() {
-                let _ = window; // window drop will end the run_loop naturally
-            }
-            // We can't reach the event loop from here; signal via proxy.
-            if let Some(proxy) = self.proxy.as_ref() {
-                // No dedicated "exit" event — easiest is to just request a
-                // redraw; the next event tick will see sessions.is_empty()
-                // and the window will naturally close on CloseRequested.
-                let _ = proxy.send_event(UserEvent::DeferredRedraw);
-            }
-            return;
-        }
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len() - 1;
         }
         self.restore_active_tab_state();
+        self.sync_tab_info_and_resize();
         self.redraw();
     }
 
@@ -254,7 +243,28 @@ impl PurrttyApp {
         self.save_active_tab_state();
         self.active = idx;
         self.restore_active_tab_state();
+        // Tab bar highlight changes — needs a redraw.
+        self.renderer
+            .as_mut()
+            .map(|r| r.set_tab_info(self.active, self.sessions.len()));
         self.redraw();
+    }
+
+    /// Push current tab count/active to the renderer, and if the tab
+    /// bar's appearance changed the usable grid area, resize every
+    /// session to match. Called on tab create/close.
+    fn sync_tab_info_and_resize(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        renderer.set_tab_info(self.active, self.sessions.len());
+        let (rows, cols) = renderer.grid_dimensions();
+        for session in &mut self.sessions {
+            if let Ok(mut term) = session.terminal.lock() {
+                term.grid_mut().resize(rows as usize, cols as usize);
+            }
+            if let Err(err) = session.pty.resize(rows, cols) {
+                warn!(?err, "pty resize failed after tab change");
+            }
+        }
     }
 
     fn save_active_tab_state(&mut self) {

@@ -39,6 +39,10 @@ pub struct Renderer {
 
     line_height: f32,
     theme: Theme,
+    /// Tab bar state: `(active_index, total_tab_count)`. The bar is
+    /// drawn only when `total > 1` so a single-tab session looks the
+    /// same as before.
+    tab_info: Option<(usize, usize)>,
 }
 
 impl Renderer {
@@ -111,21 +115,39 @@ impl Renderer {
             quads,
             line_height: cfg.line_height,
             theme: cfg.theme,
+            tab_info: None,
         })
     }
 
+    /// Height reserved for the tab bar, in pixels. Zero when there's
+    /// no tab bar (single tab / not set).
+    pub fn tab_bar_height(&self) -> f32 {
+        if self.tab_info.is_some() {
+            self.line_height + 6.0
+        } else {
+            0.0
+        }
+    }
+
+    pub fn set_tab_info(&mut self, active: usize, total: usize) {
+        self.tab_info = if total > 1 { Some((active, total)) } else { None };
+    }
+
     pub fn grid_dimensions(&self) -> (u16, u16) {
+        let tab_h = self.tab_bar_height();
         let w = (self.config.width as f32 - 2.0 * PAD_X).max(0.0);
-        let h = (self.config.height as f32 - 2.0 * PAD_Y).max(0.0);
+        let h = (self.config.height as f32 - 2.0 * PAD_Y - tab_h).max(0.0);
         let cols = (w / self.glyphs.cell_width).floor().max(1.0) as u16;
         let rows = (h / self.line_height).floor().max(1.0) as u16;
         (rows, cols)
     }
 
-    /// Layout metrics the app needs for mouse → cell conversion:
-    /// `(pad_x, pad_y, cell_width, cell_height)`.
+    /// Layout metrics the app needs for mouse → cell conversion.
+    /// `pad_y` already includes the tab bar offset so callers don't
+    /// need to know the tab bar exists.
     pub fn cell_metrics(&self) -> (f32, f32, f32, f32) {
-        (PAD_X, PAD_Y, self.glyphs.cell_width, self.line_height)
+        let grid_origin_y = PAD_Y + self.tab_bar_height();
+        (PAD_X, grid_origin_y, self.glyphs.cell_width, self.line_height)
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -184,6 +206,8 @@ impl Renderer {
         let cell_w = self.glyphs.cell_width;
         let line_h = self.line_height;
         let ascent = self.glyphs.ascent;
+        let tab_h = self.tab_bar_height();
+        let grid_top = PAD_Y + tab_h;
 
         let mut glyph_verts: Vec<GlyphVertex> = Vec::with_capacity(rows * cols);
         let mut bg_verts: Vec<QuadVertex> = Vec::new();
@@ -200,7 +224,7 @@ impl Renderer {
 
                 let (fg_color, bg_opt) = self.cell_colors(cell);
                 let cell_x = PAD_X + col_idx as f32 * cell_w;
-                let cell_y = PAD_Y + view_idx as f32 * line_h;
+                let cell_y = grid_top + view_idx as f32 * line_h;
 
                 // Background quad.
                 if let Some(bg) = bg_opt {
@@ -239,7 +263,7 @@ impl Renderer {
             if cursor.row < rows && cols > 0 {
                 let col = cursor.col.min(cols - 1);
                 let x = PAD_X + col as f32 * cell_w;
-                let y = PAD_Y + cursor.row as f32 * line_h;
+                let y = grid_top + cursor.row as f32 * line_h;
                 let cursor_gray = srgb_to_linear(0.85);
                 QuadRenderer::push_rect(
                     &mut overlay_verts,
@@ -277,9 +301,71 @@ impl Renderer {
                     continue;
                 }
                 let x = PAD_X + row_start as f32 * cell_w;
-                let y = PAD_Y + view_idx as f32 * line_h;
+                let y = grid_top + view_idx as f32 * line_h;
                 let w = (row_end - row_start) as f32 * cell_w;
                 QuadRenderer::push_rect(&mut overlay_verts, x, y, w, line_h, select_color);
+            }
+        }
+
+        // Tab bar.
+        if let Some((active_tab, tab_count)) = self.tab_info {
+            let bar_h = tab_h;
+            let bar_w = self.config.width as f32;
+            // Bar background — slightly darker than the main bg.
+            let bar_bg = [
+                srgb_to_linear(0.10),
+                srgb_to_linear(0.10),
+                srgb_to_linear(0.12),
+                1.0,
+            ];
+            QuadRenderer::push_rect(&mut bg_verts, 0.0, 0.0, bar_w, bar_h, bar_bg);
+
+            // Evenly divide the horizontal space among the tabs.
+            let usable = (bar_w - 2.0 * PAD_X).max(0.0);
+            let max_tab_w: f32 = 160.0;
+            let tab_w = (usable / tab_count as f32).min(max_tab_w).max(32.0);
+            let tab_inner_h = bar_h - 4.0;
+            let active_color = [
+                srgb_to_linear(0.22),
+                srgb_to_linear(0.32),
+                srgb_to_linear(0.52),
+                1.0,
+            ];
+            let inactive_color = [
+                srgb_to_linear(0.16),
+                srgb_to_linear(0.16),
+                srgb_to_linear(0.20),
+                1.0,
+            ];
+            for i in 0..tab_count {
+                let x = PAD_X + i as f32 * (tab_w + 4.0);
+                let y = 2.0;
+                let color = if i == active_tab { active_color } else { inactive_color };
+                QuadRenderer::push_rect(&mut bg_verts, x, y, tab_w, tab_inner_h, color);
+
+                // Render the tab index ("1", "2", ...) centered vertically.
+                let label = (i + 1).to_string();
+                let mut glyph_x = x + 10.0;
+                let glyph_y = y + 2.0;
+                for ch in label.chars() {
+                    if let Some(entry) = self.glyphs.get_or_insert(ch, &self.device, &self.queue) {
+                        let label_color = [
+                            srgb_to_linear(0.90),
+                            srgb_to_linear(0.90),
+                            srgb_to_linear(0.94),
+                            1.0,
+                        ];
+                        GlyphCache::push_glyph(
+                            &mut glyph_verts,
+                            &entry,
+                            glyph_x,
+                            glyph_y,
+                            ascent,
+                            label_color,
+                        );
+                        glyph_x += cell_w;
+                    }
+                }
             }
         }
 
