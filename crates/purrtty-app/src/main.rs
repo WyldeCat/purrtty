@@ -11,11 +11,13 @@
 
 mod agent;
 mod config;
+mod selection;
 
 use std::sync::{Arc, Mutex};
 
 use agent::AgentSession;
 use config::Config;
+use selection::{pixel_to_cell, selection_to_text, view_row_to_absolute, GridPoint, Selection};
 
 use anyhow::Result;
 use purrtty_pty::PtySession;
@@ -24,7 +26,7 @@ use purrtty_ui::Renderer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -87,6 +89,15 @@ struct PurrttyApp {
     shell_input_empty: bool,
     /// Handle to a running agent child process (if any).
     agent_session: Option<AgentSession>,
+    /// Active text selection, if any. Present while the user is
+    /// dragging or has a finalized selection they can copy.
+    selection: Option<Selection>,
+    /// True while the left mouse button is held and a selection is
+    /// being dragged.
+    selecting: bool,
+    /// Last known mouse position in physical pixels. Needed because
+    /// winit fires `CursorMoved` independent of `MouseInput`.
+    cursor_pos: (f64, f64),
 }
 
 /// Approximate cell line height for turning pixel scroll deltas into rows.
@@ -134,6 +145,86 @@ impl PurrttyApp {
         let delta = default - cur;
         if delta.abs() < 0.1 { return; }
         self.zoom_font(delta);
+    }
+
+    /// Translate a physical-pixel mouse position into an absolute
+    /// grid point (scrollback + visible rows). Returns `None` if
+    /// the renderer or terminal isn't ready.
+    fn mouse_to_grid_point(&self, x: f64, y: f64) -> Option<GridPoint> {
+        let renderer = self.renderer.as_ref()?;
+        let (pad_x, pad_y, cell_w, cell_h) = renderer.cell_metrics();
+        let (rows, cols) = renderer.grid_dimensions();
+        let (view_row, col) = pixel_to_cell(
+            x as f32,
+            y as f32,
+            pad_x,
+            pad_y,
+            cell_w,
+            cell_h,
+            rows as usize,
+            cols as usize,
+        );
+        let sb_len = self
+            .terminal
+            .as_ref()?
+            .lock()
+            .ok()
+            .map(|t| t.grid().scrollback_len())
+            .unwrap_or(0);
+        let abs_row = view_row_to_absolute(view_row, self.scroll_offset, sb_len);
+        Some(GridPoint::new(abs_row, col))
+    }
+
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(sel) = self.selection else { return };
+        if sel.is_empty() {
+            return;
+        }
+        let Some(terminal) = self.terminal.as_ref() else { return };
+        let text = match terminal.lock() {
+            Ok(t) => selection_to_text(&sel, t.grid()),
+            Err(_) => return,
+        };
+        if text.is_empty() {
+            return;
+        }
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => {
+                if let Err(err) = clipboard.set_text(&text) {
+                    warn!(?err, "clipboard write failed");
+                } else {
+                    info!(bytes = text.len(), "copied selection to clipboard");
+                }
+            }
+            Err(err) => warn!(?err, "clipboard unavailable"),
+        }
+    }
+
+    fn paste_from_clipboard(&mut self) {
+        let Some(pty) = self.pty.as_mut() else { return };
+        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(?err, "clipboard read failed");
+                return;
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        // Normalize \r\n and \n to \r (what the shell expects as Enter).
+        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        if let Err(err) = pty.write(normalized.as_bytes()) {
+            warn!(?err, "pty write failed (paste)");
+        }
+        // Any paste fills the shell's input line.
+        update_shell_input_empty(normalized.as_bytes(), &mut self.shell_input_empty);
+        // Snap scroll to live and drop selection.
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+        }
+        self.selection = None;
+        self.redraw();
     }
 
     fn handle_keyboard_input(&mut self, event: &KeyEvent) {
@@ -518,7 +609,18 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                         return;
                     }
                 };
-                if let Err(err) = renderer.render(guard.grid(), self.scroll_offset) {
+                let selection_range = self.selection.and_then(|s| {
+                    if s.is_empty() {
+                        return None;
+                    }
+                    let (start, end) = s.normalized();
+                    Some(((start.row, start.col), (end.row, end.col)))
+                });
+                if let Err(err) = renderer.render_with_selection(
+                    guard.grid(),
+                    self.scroll_offset,
+                    selection_range,
+                ) {
                     warn!(?err, "render failed");
                 }
             }
@@ -564,7 +666,7 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // Ctrl+= (zoom in) / Ctrl+- (zoom out) / Ctrl+0 (reset).
+                // Cmd/Ctrl shortcuts handled by the app, not forwarded.
                 if (self.modifiers.control_key() || self.modifiers.super_key())
                     && event.state == ElementState::Pressed
                 {
@@ -573,11 +675,49 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                             "=" | "+" => { self.zoom_font(2.0); return; }
                             "-" => { self.zoom_font(-2.0); return; }
                             "0" => { self.zoom_font_reset(); return; }
+                            "c" | "C" => { self.copy_selection_to_clipboard(); return; }
+                            "v" | "V" => { self.paste_from_clipboard(); return; }
                             _ => {}
                         }
                     }
                 }
                 self.handle_keyboard_input(&event);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x, position.y);
+                if self.selecting {
+                    if let Some(p) = self.mouse_to_grid_point(position.x, position.y) {
+                        if let Some(sel) = self.selection.as_mut() {
+                            sel.update(p);
+                            self.redraw();
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => {
+                            let (x, y) = self.cursor_pos;
+                            if let Some(p) = self.mouse_to_grid_point(x, y) {
+                                self.selection = Some(Selection::new(p));
+                                self.selecting = true;
+                                self.redraw();
+                            }
+                        }
+                        ElementState::Released => {
+                            self.selecting = false;
+                            // Clear empty click-selections so they don't
+                            // leave a stale highlight after a non-drag click.
+                            if let Some(sel) = self.selection.as_ref() {
+                                if sel.is_empty() {
+                                    self.selection = None;
+                                    self.redraw();
+                                }
+                            }
+                        }
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {

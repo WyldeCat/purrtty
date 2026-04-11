@@ -122,6 +122,12 @@ impl Renderer {
         (rows, cols)
     }
 
+    /// Layout metrics the app needs for mouse → cell conversion:
+    /// `(pad_x, pad_y, cell_width, cell_height)`.
+    pub fn cell_metrics(&self) -> (f32, f32, f32, f32) {
+        (PAD_X, PAD_Y, self.glyphs.cell_width, self.line_height)
+    }
+
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
@@ -151,7 +157,28 @@ impl Renderer {
         Some(self.grid_dimensions())
     }
 
+    /// Optional selection highlight range expressed in absolute row
+    /// coordinates (scrollback + live rows, row 0 = oldest scrollback).
+    /// `end` is exclusive — the last selected cell is `(end_row, end_col - 1)`.
+    pub fn render_with_selection(
+        &mut self,
+        grid: &Grid,
+        scroll_offset: usize,
+        selection: Option<((usize, usize), (usize, usize))>,
+    ) -> Result<()> {
+        self.render_impl(grid, scroll_offset, selection)
+    }
+
     pub fn render(&mut self, grid: &Grid, scroll_offset: usize) -> Result<()> {
+        self.render_impl(grid, scroll_offset, None)
+    }
+
+    fn render_impl(
+        &mut self,
+        grid: &Grid,
+        scroll_offset: usize,
+        selection: Option<((usize, usize), (usize, usize))>,
+    ) -> Result<()> {
         let rows = grid.rows();
         let cols = grid.cols();
         let cell_w = self.glyphs.cell_width;
@@ -222,6 +249,37 @@ impl Renderer {
                     line_h,
                     [cursor_gray, cursor_gray, cursor_gray, 0.4],
                 );
+            }
+        }
+
+        // Selection highlight. The `selection` range is in absolute row
+        // coordinates; we translate each visible row to an absolute row
+        // and emit a highlight quad for any range within this row.
+        if let Some(((start_row, start_col), (end_row, end_col))) = selection {
+            let sb_len = grid.scrollback_len();
+            let first_abs = sb_len.saturating_sub(scroll_offset.min(sb_len));
+            let select_color = [
+                srgb_to_linear(0.26),
+                srgb_to_linear(0.44),
+                srgb_to_linear(0.78),
+                0.42,
+            ];
+            for view_idx in 0..rows {
+                let abs_row = first_abs + view_idx;
+                if abs_row < start_row || abs_row > end_row {
+                    continue;
+                }
+                let row_start = if abs_row == start_row { start_col } else { 0 };
+                let row_end = if abs_row == end_row { end_col } else { cols };
+                let row_start = row_start.min(cols);
+                let row_end = row_end.min(cols);
+                if row_end <= row_start {
+                    continue;
+                }
+                let x = PAD_X + row_start as f32 * cell_w;
+                let y = PAD_Y + view_idx as f32 * line_h;
+                let w = (row_end - row_start) as f32 * cell_w;
+                QuadRenderer::push_rect(&mut overlay_verts, x, y, w, line_h, select_color);
             }
         }
 

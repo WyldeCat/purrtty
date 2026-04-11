@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 dirs = "5"
+arboard = "3"
 
 # Metadata used by `cargo bundle` to produce a macOS .app. Build with:
 #     cargo install cargo-bundle
