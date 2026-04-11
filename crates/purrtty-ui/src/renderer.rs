@@ -27,6 +27,15 @@ use crate::theme::{srgb_to_linear, RendererConfig, Theme};
 const PAD_X: f32 = 16.0;
 const PAD_Y: f32 = 16.0;
 
+/// On macOS we hide the titlebar but keep the traffic lights (red,
+/// yellow, green). They overlay the top-left corner of the content
+/// area, so the tab bar must start to the right of them. Width chosen
+/// to match how Warp / VS Code inset their tabs on macOS.
+#[cfg(target_os = "macos")]
+const TAB_BAR_LEFT_INSET: f32 = 78.0;
+#[cfg(not(target_os = "macos"))]
+const TAB_BAR_LEFT_INSET: f32 = 0.0;
+
 /// Rectangles for a single tab in the tab bar, used for mouse
 /// hit-testing. All coordinates are physical pixels relative to the
 /// top-left of the window surface.
@@ -157,19 +166,22 @@ impl Renderer {
         let bar_h = self.tab_bar_height();
         let cell_w = self.glyphs.cell_width;
         let line_h = self.line_height;
+        // Reserve space for macOS traffic-light buttons on the left.
+        let start_x = TAB_BAR_LEFT_INSET;
+        let usable_w = (bar_w - start_x).max(0.0);
         // A tab must fit at least "Tab N" (5 chars) + padding + × +
         // padding, all measured in current cell widths so the layout
         // scales with font size.
         let min_tab_w = (cell_w * 12.0).max(100.0);
         let max_tab_w = (cell_w * 22.0).max(220.0);
-        let tab_w = (bar_w / tab_count as f32).clamp(min_tab_w, max_tab_w);
+        let tab_w = (usable_w / tab_count as f32).clamp(min_tab_w, max_tab_w);
         // Close button scales with line height so it stays in
         // proportion with the text.
         let close_size = (line_h * 0.85).max(16.0);
         let close_pad = (cell_w * 0.6).max(8.0);
         let mut out = Vec::with_capacity(tab_count);
         for i in 0..tab_count {
-            let x = i as f32 * tab_w;
+            let x = start_x + i as f32 * tab_w;
             let close_x = x + tab_w - close_size - close_pad;
             let close_y = (bar_h - close_size) * 0.5;
             out.push(TabLayout {

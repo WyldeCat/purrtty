@@ -30,6 +30,8 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{Window, WindowId};
 
 /// Events posted to the winit loop from background threads.
@@ -734,6 +736,15 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 self.config.window.width,
                 self.config.window.height,
             ));
+        // On macOS, make the titlebar transparent and extend content
+        // into it. This lets our tab bar live inside the titlebar area
+        // (Warp / VS Code style) while keeping the traffic-light
+        // buttons functional.
+        #[cfg(target_os = "macos")]
+        let attrs = attrs
+            .with_titlebar_transparent(true)
+            .with_title_hidden(true)
+            .with_fullsize_content_view(true);
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(err) => {
