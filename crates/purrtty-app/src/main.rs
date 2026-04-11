@@ -185,11 +185,7 @@ impl PurrttyApp {
         }
 
         // Track the heuristic for "shell is at empty input".
-        if bytes == b"\r" {
-            self.shell_input_empty = true;
-        } else {
-            self.shell_input_empty = false;
-        }
+        update_shell_input_empty(&bytes, &mut self.shell_input_empty);
 
         // Forward to the PTY.
         if let Some(pty) = self.pty.as_mut() {
@@ -677,6 +673,51 @@ fn key_event_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>>
     event.text.as_ref().map(|t| t.as_bytes().to_vec())
 }
 
+/// Update the `shell_input_empty` heuristic based on the bytes the user
+/// just sent to the shell. This is a best-effort estimate of whether
+/// the shell's input buffer is empty, used to decide whether `>` should
+/// open agent input mode.
+///
+/// Rules:
+/// - `\r` / `\n` (Enter): shell is about to process & redraw prompt → empty.
+/// - `\x03` (Ctrl+C) / `\x15` (Ctrl+U): line cancelled/killed → empty.
+/// - `\x7f` / `\x08` (Backspace): preserve state — doesn't fill buffer.
+/// - Escape sequences (arrows, function keys, `\x1b...`): preserve state.
+/// - `\t` (Tab): preserve state — pure completion trigger.
+/// - Printable ASCII or UTF-8 text: fills the buffer → not empty.
+/// - Anything else (unknown control codes): preserve state.
+fn update_shell_input_empty(bytes: &[u8], shell_input_empty: &mut bool) {
+    if bytes.is_empty() {
+        return;
+    }
+    // Enter / LF → fresh prompt.
+    if bytes == b"\r" || bytes == b"\n" {
+        *shell_input_empty = true;
+        return;
+    }
+    // Ctrl+C, Ctrl+U → line cleared.
+    if bytes == b"\x03" || bytes == b"\x15" {
+        *shell_input_empty = true;
+        return;
+    }
+    // Backspace / Tab / escape sequences → preserve.
+    if bytes == b"\x7f" || bytes == b"\x08" || bytes == b"\t" {
+        return;
+    }
+    if bytes.first() == Some(&0x1b) {
+        return;
+    }
+    // Any printable ASCII or high-bit byte (UTF-8) → fills buffer.
+    if bytes
+        .iter()
+        .any(|&b| (0x20..=0x7e).contains(&b) || b >= 0x80)
+    {
+        *shell_input_empty = false;
+        return;
+    }
+    // Unknown lone control byte → preserve.
+}
+
 /// Query the working directory of a process via `lsof` (macOS).
 /// Returns `None` if lsof isn't available or the PID doesn't exist.
 fn shell_cwd_via_lsof(pid: u32) -> Option<std::path::PathBuf> {
@@ -719,6 +760,151 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_input_empty_backspace_preserves_state() {
+        let mut s = true;
+        update_shell_input_empty(b"\x7f", &mut s);
+        assert!(s, "backspace should preserve true");
+        let mut s = false;
+        update_shell_input_empty(b"\x7f", &mut s);
+        assert!(!s, "backspace should preserve false");
+    }
+
+    #[test]
+    fn shell_input_empty_enter_resets_to_true() {
+        let mut s = false;
+        update_shell_input_empty(b"\r", &mut s);
+        assert!(s);
+    }
+
+    #[test]
+    fn shell_input_empty_ctrl_c_resets_to_true() {
+        let mut s = false;
+        update_shell_input_empty(b"\x03", &mut s);
+        assert!(s, "Ctrl+C cancels the line");
+    }
+
+    #[test]
+    fn shell_input_empty_ctrl_u_resets_to_true() {
+        let mut s = false;
+        update_shell_input_empty(b"\x15", &mut s);
+        assert!(s, "Ctrl+U clears the line");
+    }
+
+    #[test]
+    fn shell_input_empty_arrow_keys_preserve_state() {
+        let mut s = true;
+        update_shell_input_empty(b"\x1b[A", &mut s);
+        assert!(s, "arrow up should preserve true");
+        update_shell_input_empty(b"\x1b[B", &mut s);
+        assert!(s);
+        update_shell_input_empty(b"\x1b[C", &mut s);
+        assert!(s);
+        update_shell_input_empty(b"\x1b[D", &mut s);
+        assert!(s);
+    }
+
+    #[test]
+    fn shell_input_empty_tab_preserves_state() {
+        let mut s = true;
+        update_shell_input_empty(b"\t", &mut s);
+        assert!(s);
+    }
+
+    #[test]
+    fn shell_input_empty_printable_sets_false() {
+        let mut s = true;
+        update_shell_input_empty(b"a", &mut s);
+        assert!(!s);
+    }
+
+    #[test]
+    fn shell_input_empty_utf8_sets_false() {
+        let mut s = true;
+        update_shell_input_empty("안".as_bytes(), &mut s);
+        assert!(!s, "UTF-8 multi-byte text fills the buffer");
+    }
+
+    #[test]
+    fn shell_input_empty_empty_bytes_preserve() {
+        let mut s = true;
+        update_shell_input_empty(b"", &mut s);
+        assert!(s);
+    }
+
+    /// End-to-end: pressing backspace in Normal mode (e.g. from an
+    /// extra backspace press after exiting agent mode) must not
+    /// clobber shell_input_empty, otherwise `>` can't re-enter.
+    #[test]
+    fn reenter_agent_mode_after_multiple_backspaces() {
+        let mut shell_input_empty = true;
+        update_shell_input_empty(b"\x7f", &mut shell_input_empty);
+        assert!(
+            shell_input_empty,
+            "backspace in Normal mode should not clobber shell_input_empty"
+        );
+    }
+
+    /// Simulates the state machine for handle_normal_input's `>` check
+    /// and handle_agent_input's backspace exit. Verifies that after
+    /// exiting agent mode via backspace, typing `>` again re-enters it.
+    #[test]
+    fn can_reenter_agent_mode_after_backspace_exit() {
+        // Simplified state matching PurrttyApp.
+        let mut mode = InputMode::Normal;
+        let mut shell_input_empty = true;
+
+        // Helper: simulate handle_normal_input for the `>` case.
+        fn try_enter_agent(
+            mode: &mut InputMode,
+            shell_input_empty: bool,
+            bytes: &[u8],
+            cursor_col: usize,
+        ) -> bool {
+            if bytes == b">" && shell_input_empty {
+                *mode = InputMode::AgentInput {
+                    buffer: String::new(),
+                    start_col: cursor_col,
+                };
+                return true;
+            }
+            false
+        }
+
+        // Helper: simulate handle_agent_input's backspace on empty buffer.
+        fn try_backspace_exit(mode: &mut InputMode) -> bool {
+            if let InputMode::AgentInput { buffer, .. } = mode {
+                if buffer.pop().is_some() {
+                    return false;
+                }
+                *mode = InputMode::Normal;
+                return true;
+            }
+            false
+        }
+
+        // Step 1: press `>` at prompt → enter agent mode.
+        assert!(try_enter_agent(&mut mode, shell_input_empty, b">", 2));
+        assert!(matches!(mode, InputMode::AgentInput { .. }));
+        // handle_normal_input returns before updating shell_input_empty.
+
+        // Step 2: press backspace on empty buffer → exit to Normal.
+        assert!(try_backspace_exit(&mut mode));
+        assert!(matches!(mode, InputMode::Normal));
+        // handle_agent_input doesn't touch shell_input_empty either.
+        assert!(shell_input_empty, "shell_input_empty should still be true");
+
+        // Step 3: press `>` again → should re-enter agent mode.
+        let reentered = try_enter_agent(&mut mode, shell_input_empty, b">", 2);
+        assert!(
+            reentered,
+            "should re-enter agent mode after backspace exit"
+        );
+        assert!(matches!(mode, InputMode::AgentInput { .. }));
+
+        let _ = shell_input_empty; // silence unused-mut warning
+    }
 
     /// Backspacing past the empty agent buffer should exit agent mode
     /// and return to normal shell input.

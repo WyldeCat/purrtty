@@ -88,6 +88,16 @@ cargo test -p purrtty-term && cargo test -p purrtty-app --test smoke
   buffers) over recreating them. Avoid blocking the main thread with
   heavy work — use background threads or lazy initialization instead.
 
+- **Write robust code, think through corner cases proactively.** Do not
+  patch symptoms one at a time — audit the surrounding logic and list
+  the edge cases that could break. For keyboard/input heuristics:
+  backspace, key repeat, arrow keys, Ctrl+C/U, Tab, escape sequences,
+  empty bytes, UTF-8 multi-byte input. For state machines: every
+  transition should have explicit handling, not fall through to a
+  default. For rendering timing: macOS surface readiness, frame
+  discards, focus/occlusion. When fixing a bug, add tests for the
+  adjacent corner cases you noticed, not just the reported one.
+
 ## Key patterns
 
 - **Grid is pure logic** — `purrtty-term` has zero GPU/windowing deps.
