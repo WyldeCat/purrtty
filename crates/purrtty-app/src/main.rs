@@ -96,6 +96,14 @@ struct UrlHit {
     url: String,
 }
 
+/// Result of a click inside the tab bar: either the × button of a
+/// tab was pressed, or the body of a tab was clicked.
+#[derive(Debug, Clone, Copy)]
+enum TabHit {
+    Close(usize),
+    Body(usize),
+}
+
 #[derive(Default)]
 struct SavedSessionState {
     scroll_offset: usize,
@@ -234,8 +242,8 @@ impl PurrttyApp {
         self.redraw();
     }
 
-    /// Close the active tab. If it's the last one, do nothing —
-    /// CloseRequested on the window is how the user exits the app.
+    /// Close the active tab. No-op if it's the last one — the user
+    /// should close the window (Cmd+Q / red button) to exit the app.
     fn close_tab(&mut self) {
         if self.sessions.len() <= 1 {
             return;
@@ -358,6 +366,35 @@ impl PurrttyApp {
             .unwrap_or(0);
         let abs_row = view_row_to_absolute(view_row, self.scroll_offset, sb_len);
         Some(GridPoint::new(abs_row, col))
+    }
+
+    /// Hit-test the tab bar at physical pixel `(x, y)`. Returns
+    /// `TabHit::Close(idx)` if the × button was hit, `TabHit::Body(idx)`
+    /// if the tab body was hit, and `None` for anything else (e.g. the
+    /// grid area below the bar).
+    fn tab_bar_hit(&self, x: f64, y: f64) -> Option<TabHit> {
+        let renderer = self.renderer.as_ref()?;
+        let bar_h = renderer.tab_bar_height();
+        if bar_h == 0.0 || y >= bar_h as f64 {
+            return None;
+        }
+        fn contains(rect: (f32, f32, f32, f32), px: f64, py: f64) -> bool {
+            let (rx, ry, rw, rh) = rect;
+            px >= rx as f64
+                && px < (rx + rw) as f64
+                && py >= ry as f64
+                && py < (ry + rh) as f64
+        }
+        let has_close = self.sessions.len() > 1;
+        for layout in renderer.tab_layout() {
+            if has_close && contains(layout.close_button, x, y) {
+                return Some(TabHit::Close(layout.index));
+            }
+            if contains(layout.tab, x, y) {
+                return Some(TabHit::Body(layout.index));
+            }
+        }
+        None
     }
 
     /// A URL detected at a given hit-test position.
@@ -738,6 +775,11 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
             return;
         }
 
+        // Register the initial tab with the renderer so the tab bar
+        // reserves space from the very first frame. This also resizes
+        // the session's PTY/grid down by the tab bar height.
+        self.sync_tab_info_and_resize();
+
         window.request_redraw();
 
         // Schedule a deferred redraw so the prompt is visible even if
@@ -996,15 +1038,32 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 if button == MouseButton::Left {
                     match state {
                         ElementState::Pressed => {
+                            let (x, y) = self.cursor_pos;
+                            // Tab bar takes priority over grid clicks.
+                            if let Some(hit) = self.tab_bar_hit(x, y) {
+                                match hit {
+                                    TabHit::Close(idx) => {
+                                        // Switch to the target first
+                                        // so close_tab acts on it.
+                                        if idx != self.active {
+                                            self.switch_tab(idx);
+                                        }
+                                        self.close_tab();
+                                        return;
+                                    }
+                                    TabHit::Body(idx) => {
+                                        self.switch_tab(idx);
+                                        return;
+                                    }
+                                }
+                            }
                             // Cmd+click: try to open URL at the click point.
                             if self.modifiers.super_key() {
-                                let (x, y) = self.cursor_pos;
                                 if let Some(hit) = self.url_hit_at_pixel(x, y) {
                                     open_url(&hit.url);
                                     return;
                                 }
                             }
-                            let (x, y) = self.cursor_pos;
                             if let Some(p) = self.mouse_to_grid_point(x, y) {
                                 self.selection = Some(Selection::new(p));
                                 self.selecting = true;

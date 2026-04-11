@@ -27,6 +27,18 @@ use crate::theme::{srgb_to_linear, RendererConfig, Theme};
 const PAD_X: f32 = 16.0;
 const PAD_Y: f32 = 16.0;
 
+/// Rectangles for a single tab in the tab bar, used for mouse
+/// hit-testing. All coordinates are physical pixels relative to the
+/// top-left of the window surface.
+#[derive(Debug, Clone, Copy)]
+pub struct TabLayout {
+    pub index: usize,
+    /// `(x, y, w, h)` of the whole tab cell.
+    pub tab: (f32, f32, f32, f32),
+    /// `(x, y, w, h)` of the close "×" button.
+    pub close_button: (f32, f32, f32, f32),
+}
+
 pub struct Renderer {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -119,9 +131,10 @@ impl Renderer {
         })
     }
 
-    /// Height reserved for the tab bar, in pixels. Zero when there's
-    /// no tab bar (single tab / not set). Sized around the line height
-    /// so the bar scales with font zoom.
+    /// Height reserved for the tab bar, in pixels. Always reserved
+    /// when the app has set tab info (even for a single tab), so the
+    /// bar becomes a permanent part of the window chrome. Sized around
+    /// the line height so it scales with font zoom.
     pub fn tab_bar_height(&self) -> f32 {
         if self.tab_info.is_some() {
             (self.line_height + 12.0).max(32.0)
@@ -131,7 +144,34 @@ impl Renderer {
     }
 
     pub fn set_tab_info(&mut self, active: usize, total: usize) {
-        self.tab_info = if total > 1 { Some((active, total)) } else { None };
+        self.tab_info = if total >= 1 { Some((active, total)) } else { None };
+    }
+
+    /// Compute per-tab rectangles for hit-testing (clicks). Returns a
+    /// vector of `(tab_index, tab_rect, close_button_rect)` where each
+    /// rect is `(x, y, w, h)` in physical pixel coordinates. Empty if
+    /// there is no tab bar.
+    pub fn tab_layout(&self) -> Vec<TabLayout> {
+        let Some((_, tab_count)) = self.tab_info else { return Vec::new() };
+        let bar_w = self.config.width as f32;
+        let bar_h = self.tab_bar_height();
+        let max_tab_w: f32 = 220.0;
+        let min_tab_w: f32 = 100.0;
+        let tab_w = (bar_w / tab_count as f32).clamp(min_tab_w, max_tab_w);
+        let close_size: f32 = 16.0;
+        let close_pad: f32 = 8.0;
+        let mut out = Vec::with_capacity(tab_count);
+        for i in 0..tab_count {
+            let x = i as f32 * tab_w;
+            let close_x = x + tab_w - close_size - close_pad;
+            let close_y = (bar_h - close_size) * 0.5;
+            out.push(TabLayout {
+                index: i,
+                tab: (x, 0.0, tab_w, bar_h),
+                close_button: (close_x, close_y, close_size, close_size),
+            });
+        }
+        out
     }
 
     pub fn grid_dimensions(&self) -> (u16, u16) {
@@ -413,26 +453,38 @@ impl Renderer {
                 1.0,
             ];
 
-            for i in 0..tab_count {
-                let x = i as f32 * tab_w;
+            // Precomputed layout so rendering and hit-testing agree
+            // on where each tab (and its × button) lives.
+            let layouts = self.tab_layout();
+            for layout in &layouts {
+                let i = layout.index;
+                let (x, _, tw, _) = layout.tab;
                 if i == active_tab {
                     // Active tab bg = main grid bg, making it look
                     // like the grid "rises through" the bar.
-                    QuadRenderer::push_rect(&mut bg_verts, x, 0.0, tab_w, bar_h, main_bg);
+                    QuadRenderer::push_rect(&mut bg_verts, x, 0.0, tw, bar_h, main_bg);
                     // Accent line at the top of the active tab.
-                    QuadRenderer::push_rect(&mut bg_verts, x, 0.0, tab_w, 2.0, accent);
+                    QuadRenderer::push_rect(&mut bg_verts, x, 0.0, tw, 2.0, accent);
                 }
-                // Tab label — centered. We measure the label width so
-                // it sits visually centered even when tab_w varies.
+
+                // Tab label — centered, leaving room for the × button
+                // on the right side.
+                let (cx, cy, cw, ch) = layout.close_button;
+                let label_area_right = cx - 4.0;
+                let label_area_left = x + 10.0;
                 let label = format!("Tab {}", i + 1);
                 let label_w = label.chars().count() as f32 * cell_w;
-                let glyph_x_start = x + (tab_w - label_w) * 0.5;
+                let center = (label_area_left + label_area_right) * 0.5;
+                let glyph_x_start = (center - label_w * 0.5).max(label_area_left);
                 let glyph_y = (bar_h - line_h) * 0.5;
                 let text_color = if i == active_tab { active_text } else { inactive_text };
                 let mut glyph_x = glyph_x_start;
-                for ch in label.chars() {
+                for lch in label.chars() {
+                    if glyph_x + cell_w > label_area_right {
+                        break;
+                    }
                     if let Some(entry) =
-                        self.glyphs.get_or_insert(ch, &self.device, &self.queue)
+                        self.glyphs.get_or_insert(lch, &self.device, &self.queue)
                     {
                         GlyphCache::push_glyph(
                             &mut glyph_verts,
@@ -445,11 +497,38 @@ impl Renderer {
                         glyph_x += cell_w;
                     }
                 }
+
+                // Close button: an × glyph centered inside its hit
+                // area. Skipped when there's only one tab — you can't
+                // close the last one from the bar; use the window
+                // close button for that.
+                if tab_count > 1 {
+                    let close_color = if i == active_tab {
+                        active_text
+                    } else {
+                        inactive_text
+                    };
+                    let close_glyph_x = cx + (cw - cell_w) * 0.5;
+                    let close_glyph_y = cy + (ch - line_h) * 0.5;
+                    if let Some(entry) =
+                        self.glyphs.get_or_insert('×', &self.device, &self.queue)
+                    {
+                        GlyphCache::push_glyph(
+                            &mut glyph_verts,
+                            &entry,
+                            close_glyph_x,
+                            close_glyph_y,
+                            ascent,
+                            close_color,
+                        );
+                    }
+                }
+
                 // Thin vertical separator between inactive tabs (not
                 // at the edges of the active tab — those are already
                 // defined by the bg color contrast).
                 if i + 1 < tab_count && i != active_tab && i + 1 != active_tab {
-                    let sep_x = x + tab_w;
+                    let sep_x = x + tw;
                     let sep_color = [
                         srgb_to_linear(0.09),
                         srgb_to_linear(0.09),
