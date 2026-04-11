@@ -182,17 +182,22 @@ impl Renderer {
     /// Optional selection highlight range expressed in absolute row
     /// coordinates (scrollback + live rows, row 0 = oldest scrollback).
     /// `end` is exclusive — the last selected cell is `(end_row, end_col - 1)`.
+    ///
+    /// `hovered_url` highlights a URL currently under the mouse in
+    /// view-row coordinates `(view_row, start_col, end_col)` so the
+    /// renderer can paint it in a link color with an underline.
     pub fn render_with_selection(
         &mut self,
         grid: &Grid,
         scroll_offset: usize,
         selection: Option<((usize, usize), (usize, usize))>,
+        hovered_url: Option<(usize, usize, usize)>,
     ) -> Result<()> {
-        self.render_impl(grid, scroll_offset, selection)
+        self.render_impl(grid, scroll_offset, selection, hovered_url)
     }
 
     pub fn render(&mut self, grid: &Grid, scroll_offset: usize) -> Result<()> {
-        self.render_impl(grid, scroll_offset, None)
+        self.render_impl(grid, scroll_offset, None, None)
     }
 
     fn render_impl(
@@ -200,6 +205,7 @@ impl Renderer {
         grid: &Grid,
         scroll_offset: usize,
         selection: Option<((usize, usize), (usize, usize))>,
+        hovered_url: Option<(usize, usize, usize)>,
     ) -> Result<()> {
         let rows = grid.rows();
         let cols = grid.cols();
@@ -212,8 +218,20 @@ impl Renderer {
         let mut glyph_verts: Vec<GlyphVertex> = Vec::with_capacity(rows * cols);
         let mut bg_verts: Vec<QuadVertex> = Vec::new();
 
+        // Link accent color for hovered URLs.
+        let link_color = [
+            srgb_to_linear(0.36),
+            srgb_to_linear(0.63),
+            srgb_to_linear(1.0),
+            1.0,
+        ];
+
         for view_idx in 0..rows {
             let row = grid.row_at(view_idx, scroll_offset).unwrap_or(&[]);
+            // Is this row the one with the hovered URL?
+            let hover_in_row = hovered_url.and_then(|(r, s, e)| {
+                if r == view_idx { Some((s, e)) } else { None }
+            });
             for (col_idx, cell) in row.iter().enumerate() {
                 if col_idx >= cols {
                     break;
@@ -222,7 +240,13 @@ impl Renderer {
                     continue;
                 }
 
-                let (fg_color, bg_opt) = self.cell_colors(cell);
+                let (base_fg, bg_opt) = self.cell_colors(cell);
+                // Override fg with link color when this cell is inside
+                // the currently-hovered URL span.
+                let fg_color = match hover_in_row {
+                    Some((s, e)) if col_idx >= s && col_idx < e => link_color,
+                    _ => base_fg,
+                };
                 let cell_x = PAD_X + col_idx as f32 * cell_w;
                 let cell_y = grid_top + view_idx as f32 * line_h;
 
@@ -272,6 +296,24 @@ impl Renderer {
                     cell_w,
                     line_h,
                     [cursor_gray, cursor_gray, cursor_gray, 0.4],
+                );
+            }
+        }
+
+        // Hovered-URL underline. Drawn as a 2px line at the bottom of
+        // the hovered cells, using the same link accent color.
+        if let Some((view_row, start_col, end_col)) = hovered_url {
+            if view_row < rows && start_col < cols && end_col <= cols && end_col > start_col {
+                let x = PAD_X + start_col as f32 * cell_w;
+                let y = grid_top + view_row as f32 * line_h + line_h - 2.0;
+                let w = (end_col - start_col) as f32 * cell_w;
+                QuadRenderer::push_rect(
+                    &mut overlay_verts,
+                    x,
+                    y,
+                    w,
+                    2.0,
+                    link_color,
                 );
             }
         }

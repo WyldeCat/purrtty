@@ -85,6 +85,17 @@ struct Session {
     saved: SavedSessionState,
 }
 
+/// A URL hit at a specific visible cell range. Returned by
+/// `url_hit_at_pixel`; also used to track the currently-hovered
+/// URL so the renderer can draw it with an underline + accent color.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlHit {
+    view_row: usize,
+    start_col: usize,
+    end_col: usize,
+    url: String,
+}
+
 #[derive(Default)]
 struct SavedSessionState {
     scroll_offset: usize,
@@ -126,6 +137,9 @@ struct PurrttyApp {
     /// Last known mouse position in physical pixels. Needed because
     /// winit fires `CursorMoved` independent of `MouseInput`.
     cursor_pos: (f64, f64),
+    /// Currently hovered URL (if any). Drawn with an underline and
+    /// accent color so the user can see it's clickable.
+    hovered_url: Option<UrlHit>,
 }
 
 /// Approximate cell line height for turning pixel scroll deltas into rows.
@@ -346,10 +360,8 @@ impl PurrttyApp {
         Some(GridPoint::new(abs_row, col))
     }
 
-    /// Return the URL at the given physical pixel position, if any.
-    /// Scans the row under the cursor for `http://`, `https://`, and
-    /// `file://` schemes and checks which (if any) contains the click.
-    fn url_at_pixel(&self, x: f64, y: f64) -> Option<String> {
+    /// A URL detected at a given hit-test position.
+    fn url_hit_at_pixel(&self, x: f64, y: f64) -> Option<UrlHit> {
         let renderer = self.renderer.as_ref()?;
         let (pad_x, pad_y, cell_w, cell_h) = renderer.cell_metrics();
         let (rows, cols) = renderer.grid_dimensions();
@@ -372,7 +384,7 @@ impl PurrttyApp {
         let mut byte_to_col: Vec<usize> = Vec::with_capacity(row_cells.len());
         for (col, cell) in row_cells.iter().enumerate() {
             if cell.ch == '\0' {
-                continue; // wide-char continuation
+                continue;
             }
             let len = cell.ch.len_utf8();
             row_text.push(cell.ch);
@@ -393,7 +405,12 @@ impl PurrttyApp {
                 .unwrap_or(start_col)
                 + 1;
             if click_col >= start_col && click_col < end_col {
-                return Some(row_text[range].to_string());
+                return Some(UrlHit {
+                    view_row,
+                    start_col,
+                    end_col,
+                    url: row_text[range].to_string(),
+                });
             }
         }
         None
@@ -836,8 +853,6 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 self.redraw();
             }
             WindowEvent::RedrawRequested => {
-                // Snapshot scalars + clone the terminal Arc before
-                // taking &mut self.renderer, to avoid double-borrowing.
                 let scroll_offset = self.scroll_offset;
                 let selection_range = self.selection.and_then(|s| {
                     if s.is_empty() {
@@ -846,6 +861,10 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                     let (start, end) = s.normalized();
                     Some(((start.row, start.col), (end.row, end.col)))
                 });
+                let hover = self
+                    .hovered_url
+                    .as_ref()
+                    .map(|h| (h.view_row, h.start_col, h.end_col));
                 let terminal = match self.active_terminal().cloned() {
                     Some(t) => t,
                     None => return,
@@ -865,6 +884,7 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                     guard.grid(),
                     scroll_offset,
                     selection_range,
+                    hover,
                 ) {
                     warn!(?err, "render failed");
                 }
@@ -965,6 +985,12 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                         }
                     }
                 }
+                // Update hovered URL; only redraw if it changed.
+                let new_hover = self.url_hit_at_pixel(position.x, position.y);
+                if new_hover != self.hovered_url {
+                    self.hovered_url = new_hover;
+                    self.redraw();
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
@@ -973,8 +999,8 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                             // Cmd+click: try to open URL at the click point.
                             if self.modifiers.super_key() {
                                 let (x, y) = self.cursor_pos;
-                                if let Some(url) = self.url_at_pixel(x, y) {
-                                    open_url(&url);
+                                if let Some(hit) = self.url_hit_at_pixel(x, y) {
+                                    open_url(&hit.url);
                                     return;
                                 }
                             }
