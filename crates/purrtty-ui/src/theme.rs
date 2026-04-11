@@ -19,11 +19,15 @@ pub struct ThemeBg {
 }
 
 impl ThemeBg {
-    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+    /// Build a background color from sRGB bytes. The stored value is
+    /// converted to linear space because the wgpu surface we render
+    /// into is sRGB-encoded — wgpu expects clear colors and fragment
+    /// outputs in linear space and handles the sRGB encoding itself.
+    pub fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self {
-            r: r as f32 / 255.0,
-            g: g as f32 / 255.0,
-            b: b as f32 / 255.0,
+            r: srgb_to_linear(r as f32 / 255.0),
+            g: srgb_to_linear(g as f32 / 255.0),
+            b: srgb_to_linear(b as f32 / 255.0),
             a: 1.0,
         }
     }
@@ -39,6 +43,16 @@ impl ThemeBg {
 
     pub fn as_array(self) -> [f32; 4] {
         [self.r, self.g, self.b, self.a]
+    }
+}
+
+/// Convert one sRGB channel value in `[0, 1]` to linear space using the
+/// standard sRGB transfer function.
+pub fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.040_45 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -136,5 +150,42 @@ impl Default for RendererConfig {
             line_height: 22.0,
             theme: Theme::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The surface format we use is sRGB, so wgpu interprets clear
+    /// colors and fragment output as LINEAR values. If we feed raw
+    /// sRGB values (e.g. `30 / 255.0` for #1e1e1e), wgpu treats them
+    /// as linear intensities and re-encodes them on write, producing
+    /// a much lighter display color than we intended.
+    ///
+    /// This test pins the expected behavior: `ThemeBg::rgb(30, 30, 30)`
+    /// must produce a linear color whose sRGB re-encoding round-trips
+    /// back to the input `30 / 255`. Before the fix it returned the
+    /// raw sRGB values, causing the background to display as ~#636363
+    /// instead of #1e1e1e.
+    #[test]
+    fn theme_bg_is_linear_for_srgb_surface() {
+        let bg = ThemeBg::rgb(30, 30, 30);
+        // Round-trip: linear → sRGB back to the original 8-bit value.
+        let round_trip = |v: f32| -> u8 {
+            let srgb = if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (srgb * 255.0).round() as u8
+        };
+        assert_eq!(
+            round_trip(bg.r),
+            30,
+            "background red should round-trip through sRGB encoding back to 30"
+        );
+        assert_eq!(round_trip(bg.g), 30);
+        assert_eq!(round_trip(bg.b), 30);
     }
 }

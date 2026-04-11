@@ -22,7 +22,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::glyph_cache::{GlyphCache, GlyphVertex};
 use crate::quad::{QuadRenderer, QuadVertex};
-use crate::theme::{RendererConfig, Theme};
+use crate::theme::{srgb_to_linear, RendererConfig, Theme};
 
 const PAD_X: f32 = 16.0;
 const PAD_Y: f32 = 16.0;
@@ -213,13 +213,14 @@ impl Renderer {
                 let col = cursor.col.min(cols - 1);
                 let x = PAD_X + col as f32 * cell_w;
                 let y = PAD_Y + cursor.row as f32 * line_h;
+                let cursor_gray = srgb_to_linear(0.85);
                 QuadRenderer::push_rect(
                     &mut overlay_verts,
                     x,
                     y,
                     cell_w,
                     line_h,
-                    [0.85, 0.85, 0.85, 0.4],
+                    [cursor_gray, cursor_gray, cursor_gray, 0.4],
                 );
             }
         }
@@ -292,43 +293,45 @@ impl Renderer {
 
     fn fg_rgba(&self) -> [f32; 4] {
         let c = self.theme.foreground;
-        [
-            c.r() as f32 / 255.0,
-            c.g() as f32 / 255.0,
-            c.b() as f32 / 255.0,
-            c.a() as f32 / 255.0,
-        ]
+        srgb_u8_to_linear_rgba(c.r(), c.g(), c.b(), c.a())
     }
 
     fn resolve_color(&self, c: TermColor, default: [f32; 4]) -> [f32; 4] {
         match c {
             TermColor::Default => default,
             TermColor::Indexed(i) => self.indexed_color(i),
-            TermColor::Rgb(r, g, b) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
+            TermColor::Rgb(r, g, b) => srgb_u8_to_linear_rgba(r, g, b, 255),
         }
     }
 
     fn indexed_color(&self, i: u8) -> [f32; 4] {
         if (i as usize) < self.theme.palette.len() {
             let c = self.theme.palette[i as usize];
-            return [
-                c.r() as f32 / 255.0,
-                c.g() as f32 / 255.0,
-                c.b() as f32 / 255.0,
-                1.0,
-            ];
+            return srgb_u8_to_linear_rgba(c.r(), c.g(), c.b(), 255);
         }
         if i >= 16 && i <= 231 {
             let n = i - 16;
             let r = n / 36;
             let g = (n % 36) / 6;
             let b = n % 6;
-            let lvl = |c: u8| -> f32 {
-                if c == 0 { 0.0 } else { (55.0 + c as f32 * 40.0) / 255.0 }
+            let lvl = |c: u8| -> u8 {
+                if c == 0 { 0 } else { 55 + c * 40 }
             };
-            return [lvl(r), lvl(g), lvl(b), 1.0];
+            return srgb_u8_to_linear_rgba(lvl(r), lvl(g), lvl(b), 255);
         }
-        let g = (8 + (i - 232) * 10) as f32 / 255.0;
-        [g, g, g, 1.0]
+        let g = 8 + (i - 232) * 10;
+        srgb_u8_to_linear_rgba(g, g, g, 255)
     }
+}
+
+/// Convert a u8 sRGB RGBA tuple into a linear RGBA `[f32; 4]` suitable
+/// for an sRGB-encoded wgpu surface. Alpha is never transformed — only
+/// the color channels carry the sRGB gamma curve.
+fn srgb_u8_to_linear_rgba(r: u8, g: u8, b: u8, a: u8) -> [f32; 4] {
+    [
+        srgb_to_linear(r as f32 / 255.0),
+        srgb_to_linear(g as f32 / 255.0),
+        srgb_to_linear(b as f32 / 255.0),
+        a as f32 / 255.0,
+    ]
 }
