@@ -159,6 +159,15 @@ impl PurrttyApp {
             return;
         };
 
+        // Snap scrollback view to the live bottom on any input. Doing
+        // this BEFORE the agent-mode check is important: otherwise the
+        // "> " marker would be drawn at the live bottom while the user
+        // is viewing scrollback — making it invisible.
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+            self.redraw();
+        }
+
         // Detect `>` at the start of empty shell input → agent mode.
         if bytes == b">" && self.shell_input_empty {
             // Remember the cursor column so refresh_agent_line erases
@@ -172,16 +181,11 @@ impl PurrttyApp {
                 buffer: String::new(),
                 start_col,
             };
-            // Echo a bold-cyan `> ` marker into the terminal grid.
-            self.echo_to_terminal(b"\x1b[1;36m> \x1b[0m");
+            // Draw the empty agent line via the same helper refresh
+            // uses, so entry and refresh stay consistent.
+            self.refresh_agent_line("", start_col);
             self.redraw();
             return;
-        }
-
-        // Snap scrollback view to the live bottom on any input.
-        if self.scroll_offset != 0 {
-            self.scroll_offset = 0;
-            self.redraw();
         }
 
         // Track the heuristic for "shell is at empty input".
@@ -522,18 +526,38 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 self.modifiers = mods.state();
             }
             WindowEvent::Ime(ime) => {
-                // Forward committed IME input (e.g. finalized hangul) to the
-                // shell. Preedit composition is currently not displayed —
-                // overlay rendering is a follow-up.
+                // Route committed IME input (e.g. finalized hangul) based
+                // on the current input mode — Normal goes to the PTY,
+                // AgentInput appends to the agent buffer, AgentRunning
+                // swallows the input.
                 if let Ime::Commit(text) = ime {
                     if !text.is_empty() {
                         if self.scroll_offset != 0 {
                             self.scroll_offset = 0;
                             self.redraw();
                         }
-                        if let Some(pty) = self.pty.as_mut() {
-                            if let Err(err) = pty.write(text.as_bytes()) {
-                                warn!(?err, "pty write failed (ime commit)");
+                        match &mut self.input_mode {
+                            InputMode::Normal => {
+                                update_shell_input_empty(
+                                    text.as_bytes(),
+                                    &mut self.shell_input_empty,
+                                );
+                                if let Some(pty) = self.pty.as_mut() {
+                                    if let Err(err) = pty.write(text.as_bytes()) {
+                                        warn!(?err, "pty write failed (ime commit)");
+                                    }
+                                }
+                            }
+                            InputMode::AgentInput { buffer, start_col } => {
+                                buffer.push_str(&text);
+                                let snap = buffer.clone();
+                                let col = *start_col;
+                                self.refresh_agent_line(&snap, col);
+                                self.redraw();
+                            }
+                            InputMode::AgentRunning => {
+                                // Swallow — no input forwarded while an
+                                // agent is running.
                             }
                         }
                     }
