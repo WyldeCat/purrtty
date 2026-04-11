@@ -17,7 +17,7 @@ use font_kit::metrics::Metrics as FKMetrics;
 use font_kit::properties::Properties;
 use font_kit::source::SystemSource;
 use pathfinder_geometry::transform2d::Transform2F;
-use pathfinder_geometry::vector::Vector2I;
+use pathfinder_geometry::vector::{Vector2F, Vector2I};
 use wgpu::util::DeviceExt;
 
 const ATLAS_SIZE: u32 = 2048;
@@ -448,11 +448,19 @@ impl GlyphCache {
             )
             .ok()?;
 
-        let w = bounds.width() as u32;
-        let h = bounds.height() as u32;
-        if w == 0 || h == 0 {
+        // Add 1-pixel padding on each side. raster_bounds reports the
+        // integer-rounded bounding box, but anti-aliased rasterization
+        // can spill slightly beyond that (e.g. the top of an 'o' or a
+        // descender's tail). Padding prevents those edge pixels from
+        // being clipped.
+        const PAD: i32 = 1;
+        let raw_w = bounds.width();
+        let raw_h = bounds.height();
+        if raw_w == 0 || raw_h == 0 {
             return None;
         }
+        let w = (raw_w + 2 * PAD) as u32;
+        let h = (raw_h + 2 * PAD) as u32;
 
         // Pack into atlas.
         if self.pack_x + w > ATLAS_SIZE {
@@ -466,7 +474,10 @@ impl GlyphCache {
         }
 
         let origin = bounds.origin();
-        let transform = Transform2F::from_translation(-origin.to_f32());
+        // Shift the glyph by +PAD so it's drawn at (PAD, PAD) in the
+        // larger canvas, leaving the padding area as transparent zeros.
+        let pad_vec = Vector2F::new(PAD as f32, PAD as f32);
+        let transform = Transform2F::from_translation(pad_vec - origin.to_f32());
         let mut canvas = Canvas::new(Vector2I::new(w as i32, h as i32), Format::A8);
         font.rasterize_glyph(
                 &mut canvas,
@@ -503,13 +514,17 @@ impl GlyphCache {
             },
         );
 
+        // Bearings shift by -PAD so that the quad's top-left accounts
+        // for the padding area around the glyph. The quad renders the
+        // full padded width/height; the PAD pixels at each edge are
+        // transparent and contain no ink.
         let entry = GlyphEntry {
             atlas_x: self.pack_x,
             atlas_y: self.pack_y,
             width: w,
             height: h,
-            bearing_x: origin.x() as f32,
-            bearing_y: origin.y() as f32,
+            bearing_x: (origin.x() - PAD) as f32,
+            bearing_y: (origin.y() - PAD) as f32,
         };
 
         self.pack_x += w + 1; // 1px gap to avoid bleed
