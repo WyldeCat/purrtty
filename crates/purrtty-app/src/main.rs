@@ -35,10 +35,11 @@ use winit::window::{Window, WindowId};
 /// Events posted to the winit loop from background threads.
 #[derive(Debug, Clone)]
 enum UserEvent {
-    /// Bytes arrived from the PTY or agent; redraw is needed.
-    PtyDataArrived,
-    /// The Claude agent process exited.
-    AgentFinished { exit_code: i32 },
+    /// Bytes arrived from the PTY or agent for a given session.
+    /// A redraw is only needed when `session_id` matches the active tab.
+    PtyDataArrived { session_id: u64 },
+    /// The Claude agent process exited on a specific session.
+    AgentFinished { session_id: u64, exit_code: i32 },
     /// Deferred redraw — fires ~500ms after startup to ensure the prompt
     /// is rendered even if early frames were discarded by macOS before
     /// the CAMetalLayer was presentable.
@@ -68,30 +69,56 @@ impl Default for InputMode {
 
 type SharedTerminal = Arc<Mutex<Terminal>>;
 
+/// Per-tab state. The heavy, owned resources (PTY, terminal buffer,
+/// optional agent child process) live here so that each tab has its
+/// own independent shell. The "lightweight" runtime state like scroll
+/// offset and selection is stored on `PurrttyApp` for the *currently*
+/// active tab; it's snapshotted into `saved` on every tab switch and
+/// restored when the user comes back.
+struct Session {
+    id: u64,
+    pty: PtySession,
+    terminal: SharedTerminal,
+    agent_session: Option<AgentSession>,
+    /// Preserved scroll/selection/input-mode state for this tab while
+    /// it is NOT the active tab. Unused for the active tab.
+    saved: SavedSessionState,
+}
+
+#[derive(Default)]
+struct SavedSessionState {
+    scroll_offset: usize,
+    input_mode: InputMode,
+    shell_input_empty: bool,
+    selection: Option<Selection>,
+}
+
 #[derive(Default)]
 struct PurrttyApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    pty: Option<PtySession>,
-    terminal: Option<SharedTerminal>,
     proxy: Option<EventLoopProxy<UserEvent>>,
+    /// All open tabs. `active` indexes into this. At least one session
+    /// exists once `resumed()` has initialized the window.
+    sessions: Vec<Session>,
+    active: usize,
+    /// Monotonic id counter for new sessions.
+    next_session_id: u64,
     /// How many rows the view is scrolled into scrollback. 0 = live bottom.
+    /// Tracks the active tab.
     scroll_offset: usize,
     /// Latest modifier state from `WindowEvent::ModifiersChanged`. Used by
     /// the keyboard mapper to detect Ctrl/Alt/Cmd combos.
     modifiers: ModifiersState,
     /// Loaded user config — used to seed the window and the renderer.
     config: Config,
-    /// Agent input mode state machine.
+    /// Agent input mode state machine (active tab).
     input_mode: InputMode,
     /// Heuristic: true after we forward Enter to the PTY (shell will
     /// re-emit a prompt), false after forwarding any other key. Used to
-    /// detect "user is at the start of a fresh prompt line".
+    /// detect "user is at the start of a fresh prompt line". Active tab.
     shell_input_empty: bool,
-    /// Handle to a running agent child process (if any).
-    agent_session: Option<AgentSession>,
-    /// Active text selection, if any. Present while the user is
-    /// dragging or has a finalized selection they can copy.
+    /// Active text selection for the current tab.
     selection: Option<Selection>,
     /// True while the left mouse button is held and a selection is
     /// being dragged.
@@ -122,17 +149,151 @@ impl PurrttyApp {
         }
     }
 
+    /// Accessors for the active tab's pty / terminal / agent. They
+    /// return `None` when no tabs exist yet (pre-`resumed`).
+    fn active_pty(&self) -> Option<&PtySession> {
+        self.sessions.get(self.active).map(|s| &s.pty)
+    }
+
+    fn active_pty_mut(&mut self) -> Option<&mut PtySession> {
+        self.sessions.get_mut(self.active).map(|s| &mut s.pty)
+    }
+
+    fn active_terminal(&self) -> Option<&SharedTerminal> {
+        self.sessions.get(self.active).map(|s| &s.terminal)
+    }
+
+    fn active_agent_mut(&mut self) -> Option<&mut Option<AgentSession>> {
+        self.sessions
+            .get_mut(self.active)
+            .map(|s| &mut s.agent_session)
+    }
+
+    fn session_index_by_id(&self, id: u64) -> Option<usize> {
+        self.sessions.iter().position(|s| s.id == id)
+    }
+
+    /// Create a new Session (PTY + terminal + reader thread) without
+    /// inserting it into `self.sessions`. Returns `None` on failure.
+    fn spawn_session(&mut self, rows: u16, cols: u16) -> Option<Session> {
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        let terminal = Arc::new(Mutex::new(Terminal::new(rows as usize, cols as usize)));
+        let terminal_for_reader = terminal.clone();
+        let proxy = self
+            .proxy
+            .clone()
+            .expect("proxy set before spawn_session");
+        let pty = match PtySession::spawn(rows, cols, move |bytes| {
+            if let Ok(mut term) = terminal_for_reader.lock() {
+                term.advance(bytes);
+            }
+            let _ = proxy.send_event(UserEvent::PtyDataArrived { session_id: id });
+        }) {
+            Ok(p) => p,
+            Err(err) => {
+                error!(?err, "failed to spawn pty");
+                return None;
+            }
+        };
+        Some(Session {
+            id,
+            pty,
+            terminal,
+            agent_session: None,
+            saved: SavedSessionState::default(),
+        })
+    }
+
+    /// Open a new tab with a fresh shell and switch to it.
+    fn new_tab(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else { return };
+        let (rows, cols) = renderer.grid_dimensions();
+        let Some(new_session) = self.spawn_session(rows, cols) else { return };
+        // Snapshot current tab state before switching away.
+        self.save_active_tab_state();
+        self.sessions.push(new_session);
+        self.active = self.sessions.len() - 1;
+        // Restore (empty defaults) state for the new tab.
+        self.restore_active_tab_state();
+        self.redraw();
+    }
+
+    /// Close the active tab. If it's the last one, exit the app.
+    fn close_tab(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.sessions.remove(self.active);
+        if self.sessions.is_empty() {
+            // Last tab closed — request app exit via the window.
+            if let Some(window) = self.window.as_ref() {
+                let _ = window; // window drop will end the run_loop naturally
+            }
+            // We can't reach the event loop from here; signal via proxy.
+            if let Some(proxy) = self.proxy.as_ref() {
+                // No dedicated "exit" event — easiest is to just request a
+                // redraw; the next event tick will see sessions.is_empty()
+                // and the window will naturally close on CloseRequested.
+                let _ = proxy.send_event(UserEvent::DeferredRedraw);
+            }
+            return;
+        }
+        if self.active >= self.sessions.len() {
+            self.active = self.sessions.len() - 1;
+        }
+        self.restore_active_tab_state();
+        self.redraw();
+    }
+
+    /// Switch to the tab at `idx` (0-based). No-op if out of range.
+    fn switch_tab(&mut self, idx: usize) {
+        if idx >= self.sessions.len() || idx == self.active {
+            return;
+        }
+        self.save_active_tab_state();
+        self.active = idx;
+        self.restore_active_tab_state();
+        self.redraw();
+    }
+
+    fn save_active_tab_state(&mut self) {
+        if let Some(session) = self.sessions.get_mut(self.active) {
+            session.saved = SavedSessionState {
+                scroll_offset: self.scroll_offset,
+                input_mode: std::mem::take(&mut self.input_mode),
+                shell_input_empty: self.shell_input_empty,
+                selection: self.selection.take(),
+            };
+        }
+    }
+
+    fn restore_active_tab_state(&mut self) {
+        if let Some(session) = self.sessions.get_mut(self.active) {
+            let s = std::mem::take(&mut session.saved);
+            self.scroll_offset = s.scroll_offset;
+            self.input_mode = s.input_mode;
+            self.shell_input_empty = s.shell_input_empty;
+            self.selection = s.selection;
+            self.selecting = false;
+        }
+    }
+
     fn zoom_font(&mut self, delta: f32) {
-        let Some(renderer) = self.renderer.as_mut() else { return };
-        let Some((rows, cols)) = renderer.change_font_size(delta) else { return };
+        let (rows, cols) = {
+            let Some(renderer) = self.renderer.as_mut() else { return };
+            match renderer.change_font_size(delta) {
+                Some((r, c)) => (r, c),
+                None => return,
+            }
+        };
         info!(rows, cols, delta, "font size changed");
-        if let Some(terminal) = self.terminal.as_ref() {
-            if let Ok(mut term) = terminal.lock() {
+        // Propagate new cell dimensions to every tab.
+        for session in &mut self.sessions {
+            if let Ok(mut term) = session.terminal.lock() {
                 term.grid_mut().resize(rows as usize, cols as usize);
             }
-        }
-        if let Some(pty) = self.pty.as_ref() {
-            if let Err(err) = pty.resize(rows, cols) {
+            if let Err(err) = session.pty.resize(rows, cols) {
                 warn!(?err, "pty resize failed after font zoom");
             }
         }
@@ -166,8 +327,7 @@ impl PurrttyApp {
             cols as usize,
         );
         let sb_len = self
-            .terminal
-            .as_ref()?
+            .active_terminal()?
             .lock()
             .ok()
             .map(|t| t.grid().scrollback_len())
@@ -193,7 +353,7 @@ impl PurrttyApp {
             rows as usize,
             cols as usize,
         );
-        let terminal = self.terminal.as_ref()?;
+        let terminal = self.active_terminal()?;
         let term = terminal.lock().ok()?;
         let row_cells = term.grid().row_at(view_row, self.scroll_offset)?;
         // Build the row's string and a parallel (char_byte_index → col)
@@ -234,7 +394,7 @@ impl PurrttyApp {
         if sel.is_empty() {
             return;
         }
-        let Some(terminal) = self.terminal.as_ref() else { return };
+        let Some(terminal) = self.active_terminal() else { return };
         let text = match terminal.lock() {
             Ok(t) => selection_to_text(&sel, t.grid()),
             Err(_) => return,
@@ -273,13 +433,12 @@ impl PurrttyApp {
         // This keeps zsh / fish / bash from prematurely executing
         // multi-line pastes.
         let bracketed = self
-            .terminal
-            .as_ref()
+            .active_terminal()
             .and_then(|t| t.lock().ok().map(|g| g.grid().bracketed_paste()))
             .unwrap_or(false);
         let payload = build_paste_payload(&normalized, bracketed);
 
-        if let Some(pty) = self.pty.as_mut() {
+        if let Some(pty) = self.active_pty_mut() {
             if let Err(err) = pty.write(&payload) {
                 warn!(?err, "pty write failed (paste)");
             }
@@ -301,9 +460,11 @@ impl PurrttyApp {
                 // Ctrl+C kills the running agent.
                 if let Some(bytes) = key_event_to_bytes(event, self.modifiers) {
                     if bytes == [0x03] {
-                        // Ctrl+C
-                        if let Some(session) = self.agent_session.as_mut() {
-                            session.kill();
+                        if let Some(agent) = self
+                            .active_agent_mut()
+                            .and_then(|a| a.as_mut())
+                        {
+                            agent.kill();
                         }
                     }
                 }
@@ -330,8 +491,7 @@ impl PurrttyApp {
             // Remember the cursor column so refresh_agent_line erases
             // only our echoed text, not the shell prompt to the left.
             let start_col = self
-                .terminal
-                .as_ref()
+                .active_terminal()
                 .and_then(|t| t.lock().ok().map(|g| g.grid().cursor().col))
                 .unwrap_or(0);
             self.input_mode = InputMode::AgentInput {
@@ -349,7 +509,7 @@ impl PurrttyApp {
         update_shell_input_empty(&bytes, &mut self.shell_input_empty);
 
         // Forward to the PTY.
-        if let Some(pty) = self.pty.as_mut() {
+        if let Some(pty) = self.active_pty_mut() {
             if let Err(err) = pty.write(&bytes) {
                 warn!(?err, "pty write failed");
             }
@@ -443,7 +603,7 @@ impl PurrttyApp {
     }
 
     fn echo_to_terminal(&self, bytes: &[u8]) {
-        if let Some(terminal) = self.terminal.as_ref() {
+        if let Some(terminal) = self.active_terminal() {
             if let Ok(mut term) = terminal.lock() {
                 term.advance(bytes);
             }
@@ -451,20 +611,18 @@ impl PurrttyApp {
     }
 
     fn spawn_agent(&mut self, prompt: String) {
+        let Some(session) = self.sessions.get(self.active) else { return };
+        let session_id = session.id;
         // Try OSC 7 first, then lsof on the shell PID, then purrtty's own cwd.
-        let cwd = self
+        let cwd = session
             .terminal
-            .as_ref()
-            .and_then(|t| t.lock().ok().and_then(|g| g.grid().cwd().map(|p| p.to_path_buf())))
-            .or_else(|| {
-                self.pty
-                    .as_ref()
-                    .and_then(|pty| pty.child_pid())
-                    .and_then(shell_cwd_via_lsof)
-            })
+            .lock()
+            .ok()
+            .and_then(|g| g.grid().cwd().map(|p| p.to_path_buf()))
+            .or_else(|| session.pty.child_pid().and_then(shell_cwd_via_lsof))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-        let terminal_for_agent = self.terminal.clone().unwrap();
+        let terminal_for_agent = session.terminal.clone();
         let proxy = self.proxy.clone().unwrap();
 
         let proxy_for_exit = proxy.clone();
@@ -475,15 +633,20 @@ impl PurrttyApp {
                 if let Ok(mut term) = terminal_for_agent.lock() {
                     term.advance(bytes);
                 }
-                let _ = proxy.send_event(UserEvent::PtyDataArrived);
+                let _ = proxy.send_event(UserEvent::PtyDataArrived { session_id });
             },
             move |exit_code| {
-                let _ = proxy_for_exit.send_event(UserEvent::AgentFinished { exit_code });
+                let _ = proxy_for_exit.send_event(UserEvent::AgentFinished {
+                    session_id,
+                    exit_code,
+                });
             },
         ) {
-            Ok(session) => {
+            Ok(agent) => {
                 info!(?cwd, "agent spawned");
-                self.agent_session = Some(session);
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.agent_session = Some(agent);
+                }
             }
             Err(err) => {
                 error!(?err, "failed to spawn agent");
@@ -533,35 +696,21 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
         let (rows, cols) = renderer.grid_dimensions();
         info!(rows, cols, "initial grid dimensions");
 
-        let terminal = Arc::new(Mutex::new(Terminal::new(rows as usize, cols as usize)));
-
-        let terminal_for_reader = terminal.clone();
-        let proxy_for_reader = self
-            .proxy
-            .clone()
-            .expect("proxy set before ApplicationHandler::resumed");
-
-        let pty = match PtySession::spawn(rows, cols, move |bytes| {
-            if let Ok(mut term) = terminal_for_reader.lock() {
-                term.advance(bytes);
-            }
-            let _ = proxy_for_reader.send_event(UserEvent::PtyDataArrived);
-        }) {
-            Ok(p) => p,
-            Err(err) => {
-                error!(?err, "failed to spawn pty");
-                event_loop.exit();
-                return;
-            }
-        };
-
         // Allow macOS / X11 IME composition events to flow through.
         window.set_ime_allowed(true);
 
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
-        self.pty = Some(pty);
-        self.terminal = Some(terminal);
+
+        // Spawn the first tab.
+        if let Some(session) = self.spawn_session(rows, cols) {
+            self.sessions.push(session);
+            self.active = 0;
+        } else {
+            event_loop.exit();
+            return;
+        }
+
         window.request_redraw();
 
         // Schedule a deferred redraw so the prompt is visible even if
@@ -581,47 +730,61 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::PtyDataArrived => {
-                // Drain any pending terminal responses (DA, DSR, etc.)
-                // that were queued during the last advance() call.
+            UserEvent::PtyDataArrived { session_id } => {
+                // Drain pending terminal responses for the session whose
+                // PTY produced the bytes, then write them back. Only
+                // redraw when it's the active session — background tabs
+                // update silently.
+                let Some(idx) = self.session_index_by_id(session_id) else { return };
                 let responses = self
-                    .terminal
-                    .as_ref()
-                    .and_then(|t| {
-                        t.lock()
+                    .sessions
+                    .get(idx)
+                    .and_then(|s| {
+                        s.terminal
+                            .lock()
                             .ok()
                             .map(|mut term| term.grid_mut().drain_responses())
                     })
                     .unwrap_or_default();
-                if let Some(pty) = self.pty.as_mut() {
+                if let Some(session) = self.sessions.get_mut(idx) {
                     for resp in responses {
-                        let _ = pty.write(&resp);
+                        let _ = session.pty.write(&resp);
                     }
                 }
-                self.redraw();
+                if idx == self.active {
+                    self.redraw();
+                }
             }
             UserEvent::DeferredRedraw => {
                 self.redraw();
             }
-            UserEvent::AgentFinished { exit_code } => {
-                info!(exit_code, "agent finished");
-                self.input_mode = InputMode::Normal;
-                self.agent_session = None;
-                // Print a status marker into the terminal grid.
+            UserEvent::AgentFinished { session_id, exit_code } => {
+                info!(session_id, exit_code, "agent finished");
+                let Some(idx) = self.session_index_by_id(session_id) else { return };
+                if let Some(session) = self.sessions.get_mut(idx) {
+                    session.agent_session = None;
+                }
                 let marker = if exit_code == 0 {
                     "\r\n\x1b[1;32m✓ agent done\x1b[0m\r\n"
                 } else {
                     "\r\n\x1b[1;31m✗ agent failed\x1b[0m\r\n"
                 };
-                self.echo_to_terminal(marker.as_bytes());
-                // Nudge the shell to re-display its prompt by sending
-                // a newline. The shell sees an empty command and just
-                // prints a fresh prompt.
-                if let Some(pty) = self.pty.as_mut() {
-                    let _ = pty.write(b"\n");
+                // Echo the marker directly to the affected session's grid.
+                if let Some(session) = self.sessions.get(idx) {
+                    if let Ok(mut term) = session.terminal.lock() {
+                        term.advance(marker.as_bytes());
+                    }
                 }
-                self.shell_input_empty = true;
-                self.redraw();
+                if let Some(session) = self.sessions.get_mut(idx) {
+                    let _ = session.pty.write(b"\n");
+                }
+                // Mode + heuristic live on the active tab; only touch them
+                // when the finished agent was the active tab's.
+                if idx == self.active {
+                    self.input_mode = InputMode::Normal;
+                    self.shell_input_empty = true;
+                    self.redraw();
+                }
             }
         }
     }
@@ -643,29 +806,42 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 self.redraw();
             }
             WindowEvent::Resized(size) => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize(size);
-                    let (rows, cols) = renderer.grid_dimensions();
-                    if let Some(terminal) = self.terminal.as_ref() {
-                        if let Ok(mut term) = terminal.lock() {
-                            term.grid_mut().resize(rows as usize, cols as usize);
-                        }
+                let (rows, cols) = match self.renderer.as_mut() {
+                    Some(renderer) => {
+                        renderer.resize(size);
+                        renderer.grid_dimensions()
                     }
-                    if let Some(pty) = self.pty.as_ref() {
-                        if let Err(err) = pty.resize(rows, cols) {
-                            warn!(?err, "pty resize failed");
-                        }
+                    None => return,
+                };
+                // Resize every session's terminal grid + PTY so
+                // inactive tabs don't lag behind in size.
+                for session in &mut self.sessions {
+                    if let Ok(mut term) = session.terminal.lock() {
+                        term.grid_mut().resize(rows as usize, cols as usize);
+                    }
+                    if let Err(err) = session.pty.resize(rows, cols) {
+                        warn!(?err, "pty resize failed");
                     }
                 }
                 self.redraw();
             }
             WindowEvent::RedrawRequested => {
-                let renderer = match self.renderer.as_mut() {
-                    Some(r) => r,
+                // Snapshot scalars + clone the terminal Arc before
+                // taking &mut self.renderer, to avoid double-borrowing.
+                let scroll_offset = self.scroll_offset;
+                let selection_range = self.selection.and_then(|s| {
+                    if s.is_empty() {
+                        return None;
+                    }
+                    let (start, end) = s.normalized();
+                    Some(((start.row, start.col), (end.row, end.col)))
+                });
+                let terminal = match self.active_terminal().cloned() {
+                    Some(t) => t,
                     None => return,
                 };
-                let terminal = match self.terminal.as_ref() {
-                    Some(t) => t,
+                let renderer = match self.renderer.as_mut() {
+                    Some(r) => r,
                     None => return,
                 };
                 let guard = match terminal.lock() {
@@ -675,16 +851,9 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                         return;
                     }
                 };
-                let selection_range = self.selection.and_then(|s| {
-                    if s.is_empty() {
-                        return None;
-                    }
-                    let (start, end) = s.normalized();
-                    Some(((start.row, start.col), (end.row, end.col)))
-                });
                 if let Err(err) = renderer.render_with_selection(
                     guard.grid(),
-                    self.scroll_offset,
+                    scroll_offset,
                     selection_range,
                 ) {
                     warn!(?err, "render failed");
@@ -710,7 +879,7 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                                     text.as_bytes(),
                                     &mut self.shell_input_empty,
                                 );
-                                if let Some(pty) = self.pty.as_mut() {
+                                if let Some(pty) = self.active_pty_mut() {
                                     if let Err(err) = pty.write(text.as_bytes()) {
                                         warn!(?err, "pty write failed (ime commit)");
                                     }
@@ -744,12 +913,31 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                                 _ => {}
                             }
                         }
-                        // Clipboard: Cmd only. Ctrl+C must stay SIGINT
-                        // and Ctrl+V must stay a control byte.
+                        // Clipboard + tabs: Cmd only. Ctrl+C must stay
+                        // SIGINT, Ctrl+W stays kill-word, Ctrl+T stays
+                        // transpose — we never steal those from the shell.
                         if self.modifiers.super_key() {
                             match s.as_str() {
                                 "c" | "C" => { self.copy_selection_to_clipboard(); return; }
                                 "v" | "V" => { self.paste_from_clipboard(); return; }
+                                "t" | "T" => { self.new_tab(); return; }
+                                "w" | "W" => { self.close_tab(); return; }
+                                "1" => { self.switch_tab(0); return; }
+                                "2" => { self.switch_tab(1); return; }
+                                "3" => { self.switch_tab(2); return; }
+                                "4" => { self.switch_tab(3); return; }
+                                "5" => { self.switch_tab(4); return; }
+                                "6" => { self.switch_tab(5); return; }
+                                "7" => { self.switch_tab(6); return; }
+                                "8" => { self.switch_tab(7); return; }
+                                "9" => {
+                                    // Cmd+9 jumps to the last tab, matching
+                                    // Chrome / iTerm2 convention.
+                                    if !self.sessions.is_empty() {
+                                        self.switch_tab(self.sessions.len() - 1);
+                                    }
+                                    return;
+                                }
                                 _ => {}
                             }
                         }
@@ -810,8 +998,7 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                     return;
                 }
                 let max = self
-                    .terminal
-                    .as_ref()
+                    .active_terminal()
                     .and_then(|t| t.lock().ok().map(|g| g.grid().scrollback_len()))
                     .unwrap_or(0);
                 // Positive y = scroll up = show older content = larger offset.
