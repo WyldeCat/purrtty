@@ -52,28 +52,30 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// VS Code-ish dark theme — what previous milestones hard-coded.
+    /// VS Code Dark+ — the default dark theme shipped with VS Code.
     pub fn dark() -> Self {
         Self {
-            foreground: GlyphColor::rgb(220, 220, 220),
-            background: ThemeBg::rgb(13, 13, 20),
+            // #cccccc — VS Code's `editor.foreground` default.
+            foreground: GlyphColor::rgb(204, 204, 204),
+            // #1e1e1e — VS Code's `editor.background` default.
+            background: ThemeBg::rgb(30, 30, 30),
             palette: [
-                GlyphColor::rgb(0, 0, 0),
-                GlyphColor::rgb(205, 49, 49),
-                GlyphColor::rgb(13, 188, 121),
-                GlyphColor::rgb(229, 229, 16),
-                GlyphColor::rgb(36, 114, 200),
-                GlyphColor::rgb(188, 63, 188),
-                GlyphColor::rgb(17, 168, 205),
-                GlyphColor::rgb(229, 229, 229),
-                GlyphColor::rgb(102, 102, 102),
-                GlyphColor::rgb(241, 76, 76),
-                GlyphColor::rgb(35, 209, 139),
-                GlyphColor::rgb(245, 245, 67),
-                GlyphColor::rgb(59, 142, 234),
-                GlyphColor::rgb(214, 112, 214),
-                GlyphColor::rgb(41, 184, 219),
-                GlyphColor::rgb(255, 255, 255),
+                GlyphColor::rgb(0, 0, 0),         // 000000 black
+                GlyphColor::rgb(205, 49, 49),     // cd3131 red
+                GlyphColor::rgb(13, 188, 121),    // 0dbc79 green
+                GlyphColor::rgb(229, 229, 16),    // e5e510 yellow
+                GlyphColor::rgb(36, 114, 200),    // 2472c8 blue
+                GlyphColor::rgb(188, 63, 188),    // bc3fbc magenta
+                GlyphColor::rgb(17, 168, 205),    // 11a8cd cyan
+                GlyphColor::rgb(229, 229, 229),   // e5e5e5 white
+                GlyphColor::rgb(102, 102, 102),   // 666666 bright black
+                GlyphColor::rgb(241, 76, 76),     // f14c4c bright red
+                GlyphColor::rgb(35, 209, 139),    // 23d18b bright green
+                GlyphColor::rgb(245, 245, 67),    // f5f543 bright yellow
+                GlyphColor::rgb(59, 142, 234),    // 3b8eea bright blue
+                GlyphColor::rgb(214, 112, 214),   // d670d6 bright magenta
+                GlyphColor::rgb(41, 184, 219),    // 29b8db bright cyan
+                GlyphColor::rgb(229, 229, 229),   // e5e5e5 bright white
             ],
         }
     }
