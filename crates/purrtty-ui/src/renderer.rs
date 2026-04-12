@@ -27,14 +27,9 @@ use crate::theme::{srgb_to_linear, RendererConfig, Theme};
 const PAD_X: f32 = 16.0;
 const PAD_Y: f32 = 16.0;
 
-/// On macOS we hide the titlebar but keep the traffic lights (red,
-/// yellow, green). They overlay the top-left corner of the content
-/// area, so the tab bar must start to the right of them. Width chosen
-/// to match how Warp / VS Code inset their tabs on macOS.
-#[cfg(target_os = "macos")]
-const TAB_BAR_LEFT_INSET: f32 = 78.0;
+/// Default tab-bar left inset on non-macOS (no traffic lights).
 #[cfg(not(target_os = "macos"))]
-const TAB_BAR_LEFT_INSET: f32 = 0.0;
+const TAB_BAR_LEFT_INSET_DEFAULT: f32 = 0.0;
 
 /// Rectangles for a single tab in the tab bar, used for mouse
 /// hit-testing. All coordinates are physical pixels relative to the
@@ -64,6 +59,11 @@ pub struct Renderer {
     /// drawn only when `total > 1` so a single-tab session looks the
     /// same as before.
     tab_info: Option<(usize, usize)>,
+    /// Left inset in pixels for the tab bar — tabs start after this.
+    /// On macOS it's dynamic (scales with bar height so tabs dodge the
+    /// traffic-light buttons as they reposition). On other platforms
+    /// it's 0.
+    tab_bar_left_inset: f32,
 }
 
 impl Renderer {
@@ -137,6 +137,10 @@ impl Renderer {
             line_height: cfg.line_height,
             theme: cfg.theme,
             tab_info: None,
+            #[cfg(target_os = "macos")]
+            tab_bar_left_inset: 0.0,
+            #[cfg(not(target_os = "macos"))]
+            tab_bar_left_inset: TAB_BAR_LEFT_INSET_DEFAULT,
         })
     }
 
@@ -156,6 +160,10 @@ impl Renderer {
         self.tab_info = if total >= 1 { Some((active, total)) } else { None };
     }
 
+    pub fn set_tab_bar_left_inset(&mut self, inset: f32) {
+        self.tab_bar_left_inset = inset;
+    }
+
     /// Compute per-tab rectangles for hit-testing (clicks). All
     /// dimensions scale with `cell_width` / `line_height` so the tab
     /// bar grows proportionally under Cmd+/- font zoom — tab labels
@@ -166,8 +174,8 @@ impl Renderer {
         let bar_h = self.tab_bar_height();
         let cell_w = self.glyphs.cell_width;
         let line_h = self.line_height;
-        // Reserve space for macOS traffic-light buttons on the left.
-        let start_x = TAB_BAR_LEFT_INSET;
+        // Reserve space for traffic-light buttons on the left.
+        let start_x = self.tab_bar_left_inset;
         let usable_w = (bar_w - start_x).max(0.0);
         // A tab must fit at least "Tab N" (5 chars) + padding + × +
         // padding, all measured in current cell widths so the layout

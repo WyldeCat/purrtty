@@ -197,6 +197,29 @@ impl PurrttyApp {
         self.sessions.iter().position(|s| s.id == id)
     }
 
+    /// Reposition macOS traffic lights and update the dynamic tab
+    /// left inset. Split borrows window (immut) and renderer (mut)
+    /// via separate field access.
+    #[cfg(target_os = "macos")]
+    fn update_macos_traffic_lights(&mut self) {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        let bar_h = self
+            .renderer
+            .as_ref()
+            .map(|r| r.tab_bar_height() / scale)
+            .unwrap_or(40.0);
+        if let Some(window) = self.window.as_ref() {
+            macos::reposition_traffic_lights(window, bar_h);
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_tab_bar_left_inset(macos::tab_bar_left_inset(bar_h));
+        }
+    }
+
     /// Create a new Session (PTY + terminal + reader thread) without
     /// inserting it into `self.sessions`. Returns `None` on failure.
     fn spawn_session(&mut self, rows: u16, cols: u16) -> Option<Session> {
@@ -331,17 +354,9 @@ impl PurrttyApp {
                 warn!(?err, "pty resize failed after font zoom");
             }
         }
-        // Traffic-light centering depends on tab bar height, which
-        // scales with font size.
+        // Traffic-light centering + tab inset depend on bar height.
         #[cfg(target_os = "macos")]
-        {
-            if let (Some(window), Some(renderer)) =
-                (self.window.as_ref(), self.renderer.as_ref())
-            {
-                let bar_h = renderer.tab_bar_height() / window.scale_factor() as f32;
-                macos::reposition_traffic_lights(window, bar_h);
-            }
-        }
+        self.update_macos_traffic_lights();
         self.redraw();
     }
 
@@ -802,14 +817,10 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
         // the session's PTY/grid down by the tab bar height.
         self.sync_tab_info_and_resize();
 
-        // Vertically center macOS traffic lights inside our tab bar.
+        // Center macOS traffic lights inside our tab bar and compute
+        // the dynamic left inset so tabs start after the buttons.
         #[cfg(target_os = "macos")]
-        {
-            if let Some(renderer) = self.renderer.as_ref() {
-                let bar_h = renderer.tab_bar_height() / window.scale_factor() as f32;
-                macos::reposition_traffic_lights(&window, bar_h);
-            }
-        }
+        self.update_macos_traffic_lights();
 
         window.request_redraw();
 
