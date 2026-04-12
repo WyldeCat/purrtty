@@ -32,12 +32,16 @@ pub fn reposition_traffic_lights(window: &Window, bar_height_logical_px: f32) {
             return;
         }
     };
+    // Default macOS traffic-light x positions (close, minimize, zoom).
+    // Used as the baseline for shifting; never read from the live frame
+    // so repeated calls (zoom in, zoom out) are idempotent.
+    const DEFAULT_X: [f64; 3] = [9.0, 32.0, 55.0];
     let buttons = [
-        NSWindowButton::CloseButton,
-        NSWindowButton::MiniaturizeButton,
-        NSWindowButton::ZoomButton,
+        (NSWindowButton::CloseButton, DEFAULT_X[0]),
+        (NSWindowButton::MiniaturizeButton, DEFAULT_X[1]),
+        (NSWindowButton::ZoomButton, DEFAULT_X[2]),
     ];
-    for kind in buttons {
+    for (kind, original_x) in buttons {
         let Some(button) = ns_window.standardWindowButton(kind) else {
             continue;
         };
@@ -85,15 +89,11 @@ pub fn reposition_traffic_lights(window: &Window, bar_height_logical_px: f32) {
             "repositioning traffic light"
         );
         // Shift x so the left-edge padding matches the top-edge
-        // padding, giving uniform inset on both axes. The first
-        // button's default x (9pt) is the macOS standard, but our
-        // vertical centering pushes top to ~10pt, so we bump x by
-        // the same delta (desired_top − original_left_padding) for
-        // visual symmetry. Buttons after the first keep their
-        // original inter-button spacing.
-        let original_left = 9.0_f64;
-        let x_offset = desired_top - original_left;
-        let new_x = frame.origin.x + x_offset;
+        // padding, giving uniform inset on both axes. Computed from
+        // the ORIGINAL macOS default position, not the live frame,
+        // so repeated calls (zoom in → zoom out) are idempotent.
+        let x_offset = desired_top - DEFAULT_X[0];
+        let new_x = original_x + x_offset;
         let new_origin = NSPoint {
             x: new_x,
             y: new_y,

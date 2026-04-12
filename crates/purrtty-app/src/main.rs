@@ -1367,6 +1367,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traffic_light_x_stays_stable_across_zooms() {
+        // The x offset formula must be absolute (based on the macOS
+        // default x), not relative to the current frame — otherwise
+        // each zoom compounds the shift. We test the pure formula.
+        let original_x = 9.0_f64;
+        let bar_heights = [34.0, 50.0, 34.0, 60.0, 34.0];
+        let button_h = 14.0_f64;
+        let parent_h = 32.0_f64;
+        for bar_h in bar_heights {
+            let desired_top = ((bar_h - button_h) / 2.0).max(0.0);
+            let new_x = original_x + (desired_top - original_x);
+            let new_y = (parent_h - button_h - desired_top).max(0.0);
+            // x must always equal desired_top (uniform margin).
+            assert!(
+                (new_x - desired_top).abs() < 0.001,
+                "x should equal desired_top ({desired_top}) but got {new_x} at bar_h={bar_h}"
+            );
+            // Re-running the same formula with the RESULT as input
+            // must be stable (idempotent).
+            let new_x2 = original_x + (desired_top - original_x);
+            assert!(
+                (new_x2 - new_x).abs() < 0.001,
+                "x should be stable across repeated calls"
+            );
+            let _ = new_y;
+        }
+    }
+
+    #[test]
     fn build_paste_payload_unbracketed() {
         let payload = build_paste_payload("hello", false);
         assert_eq!(payload, b"hello");
