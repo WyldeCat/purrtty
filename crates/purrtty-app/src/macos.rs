@@ -84,8 +84,18 @@ pub fn reposition_traffic_lights(window: &Window, bar_height_logical_px: f32) {
             new_y,
             "repositioning traffic light"
         );
+        // Shift x so the left-edge padding matches the top-edge
+        // padding, giving uniform inset on both axes. The first
+        // button's default x (9pt) is the macOS standard, but our
+        // vertical centering pushes top to ~10pt, so we bump x by
+        // the same delta (desired_top − original_left_padding) for
+        // visual symmetry. Buttons after the first keep their
+        // original inter-button spacing.
+        let original_left = 9.0_f64;
+        let x_offset = desired_top - original_left;
+        let new_x = frame.origin.x + x_offset;
         let new_origin = NSPoint {
-            x: frame.origin.x,
+            x: new_x,
             y: new_y,
         };
         // SAFETY: setFrameOrigin: is a standard NSView method; the
