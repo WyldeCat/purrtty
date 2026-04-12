@@ -48,6 +48,9 @@ enum UserEvent {
     /// is rendered even if early frames were discarded by macOS before
     /// the CAMetalLayer was presentable.
     DeferredRedraw,
+    /// Periodic tick (~100ms) while an agent block is active, driving
+    /// the spinner animation and elapsed-time update in the footer.
+    StatusTick { session_id: u64 },
 }
 
 /// Keyboard input routing state.
@@ -156,6 +159,9 @@ struct PurrttyApp {
     /// Currently hovered URL (if any). Drawn with an underline and
     /// accent color so the user can see it's clickable.
     hovered_url: Option<UrlHit>,
+    /// Monotonic tick counter for the block footer spinner animation.
+    /// Incremented by StatusTick events.
+    spinner_tick: usize,
 }
 
 /// Approximate cell line height for turning pixel scroll deltas into rows.
@@ -770,6 +776,12 @@ impl PurrttyApp {
                     sess.agent_session = Some(agent);
                     sess.block = Some(block);
                 }
+                // Kick off the spinner timer.
+                let proxy_tick = self.proxy.clone().unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let _ = proxy_tick.send_event(UserEvent::StatusTick { session_id });
+                });
             }
             Err(err) => {
                 error!(?err, "failed to spawn agent");
@@ -899,6 +911,31 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
             }
             UserEvent::DeferredRedraw => {
                 self.redraw();
+            }
+            UserEvent::StatusTick { session_id } => {
+                // Advance the spinner and redraw — only if the block
+                // is still active on the session that fired the tick.
+                if let Some(idx) = self.session_index_by_id(session_id) {
+                    let still_active = self
+                        .sessions
+                        .get(idx)
+                        .and_then(|s| s.block.as_ref())
+                        .and_then(|b| b.lock().ok())
+                        .map(|b| b.is_active())
+                        .unwrap_or(false);
+                    if still_active {
+                        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+                        if idx == self.active {
+                            self.redraw();
+                        }
+                        // Schedule the next tick.
+                        let proxy = self.proxy.clone().unwrap();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            let _ = proxy.send_event(UserEvent::StatusTick { session_id });
+                        });
+                    }
+                }
             }
             UserEvent::AgentFinished { session_id, exit_code } => {
                 info!(session_id, exit_code, "agent finished");
