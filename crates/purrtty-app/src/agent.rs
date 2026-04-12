@@ -3,8 +3,8 @@
 //! `AgentSession::spawn` runs `claude -p "<prompt>"` with
 //! `--output-format stream-json` so we get structured events (text
 //! deltas, tool use, results) instead of raw markdown. Each event is
-//! formatted into clean ANSI text and delivered to the caller via
-//! `on_output(&[u8])`, which feeds `terminal.advance()`.
+//! parsed into an `AgentOutput` carrying both ANSI-formatted terminal
+//! text and a `BlockUpdate` for the block state machine.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -15,6 +15,25 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+/// What a single stream-json event produces.
+pub struct AgentOutput {
+    /// ANSI text to echo into the terminal grid. `None` for events
+    /// that don't produce visible output.
+    pub text: Option<String>,
+    /// Structured update for the Block state machine.
+    pub update: BlockUpdate,
+}
+
+/// Structured block update extracted from a stream-json event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockUpdate {
+    None,
+    TextDelta(String),
+    ToolStart { name: String },
+    ToolInput(String),
+    ContentBlockStop,
+}
+
 /// A running Claude CLI session. Call [`AgentSession::kill`] to abort.
 pub struct AgentSession {
     child: Option<Child>,
@@ -23,12 +42,11 @@ pub struct AgentSession {
 
 impl AgentSession {
     /// Spawn `claude -p <prompt>` with streaming JSON output and full
-    /// tool access. Parsed events are formatted into ANSI text and
-    /// delivered via `on_output`. `on_exit` fires after the process
-    /// terminates.
-    pub fn spawn<F, G>(prompt: &str, cwd: &Path, on_output: F, on_exit: G) -> Result<Self>
+    /// tool access. Parsed events are delivered via `on_event`.
+    /// `on_exit` fires after the process terminates.
+    pub fn spawn<F, G>(prompt: &str, cwd: &Path, on_event: F, on_exit: G) -> Result<Self>
     where
-        F: FnMut(&[u8]) + Send + 'static,
+        F: FnMut(AgentOutput) + Send + 'static,
         G: FnOnce(i32) + Send + 'static,
     {
         debug!(?cwd, "spawning claude agent (stream-json)");
@@ -57,7 +75,7 @@ impl AgentSession {
         let reader_thread = thread::Builder::new()
             .name("purrtty-agent-reader".into())
             .spawn(move || {
-                Self::reader_loop(stdout, stderr, on_output, on_exit);
+                Self::reader_loop(stdout, stderr, on_event, on_exit);
             })
             .context("spawn agent reader thread")?;
 
@@ -77,10 +95,10 @@ impl AgentSession {
     fn reader_loop<F, G>(
         stdout: impl Read,
         mut stderr: impl Read,
-        mut on_output: F,
+        mut on_event: F,
         on_exit: G,
     ) where
-        F: FnMut(&[u8]),
+        F: FnMut(AgentOutput),
         G: FnOnce(i32),
     {
         let reader = BufReader::new(stdout);
@@ -98,13 +116,11 @@ impl AgentSession {
             }
             let json: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
-                Err(_) => {
-                    // Not valid JSON — might be a stray log line. Skip.
-                    continue;
-                }
+                Err(_) => continue,
             };
-            if let Some(formatted) = format_event(&json) {
-                on_output(formatted.as_bytes());
+            let output = parse_event(&json);
+            if output.text.is_some() || output.update != BlockUpdate::None {
+                on_event(output);
             }
         }
 
@@ -124,82 +140,103 @@ impl AgentSession {
     }
 }
 
-/// Turn a streaming JSON event into formatted ANSI text for the
-/// terminal grid. Returns `None` for events we don't want to render.
-fn format_event(json: &Value) -> Option<String> {
-    let event_type = json.get("type")?.as_str()?;
+/// Parse a stream-json line into an `AgentOutput` carrying both
+/// formatted terminal text and a structured block update.
+fn parse_event(json: &Value) -> AgentOutput {
+    let none = AgentOutput {
+        text: None,
+        update: BlockUpdate::None,
+    };
+    let Some(event_type) = json.get("type").and_then(|t| t.as_str()) else {
+        return none;
+    };
 
     match event_type {
         "stream_event" => {
-            let event = json.get("event")?;
-            let event_kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let Some(event) = json.get("event") else {
+                return none;
+            };
+            let event_kind = event
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
 
             match event_kind {
-                // Text delta — the main content stream. Rendered as-is.
                 "content_block_delta" => {
-                    let delta = event.get("delta")?;
-                    let delta_type = delta.get("type").and_then(|t| t.as_str())?;
+                    let Some(delta) = event.get("delta") else {
+                        return none;
+                    };
+                    let delta_type = delta.get("type").and_then(|t| t.as_str());
                     match delta_type {
-                        "text_delta" => {
-                            // Claude emits bare \n; terminals need \r\n
-                            // to return the cursor to column 0.
-                            delta
+                        Some("text_delta") => {
+                            let raw = delta
                                 .get("text")
                                 .and_then(|t| t.as_str())
-                                .map(|s| s.replace('\n', "\r\n"))
+                                .unwrap_or("");
+                            let ansi = raw.replace('\n', "\r\n");
+                            AgentOutput {
+                                text: Some(ansi),
+                                update: BlockUpdate::TextDelta(raw.to_string()),
+                            }
                         }
-                        // Tool input streaming — show in dim.
-                        "input_json_delta" => {
-                            delta
+                        Some("input_json_delta") => {
+                            let partial = delta
                                 .get("partial_json")
                                 .and_then(|p| p.as_str())
-                                .map(|s| format!("\x1b[2m{}\x1b[0m", s))
+                                .unwrap_or("");
+                            AgentOutput {
+                                text: Some(format!("\x1b[2m{}\x1b[0m", partial)),
+                                update: BlockUpdate::ToolInput(partial.to_string()),
+                            }
                         }
-                        _ => None,
+                        _ => none,
                     }
                 }
 
-                // New content block — detect tool use start.
                 "content_block_start" => {
-                    let block = event.get("content_block")?;
+                    let Some(block) = event.get("content_block") else {
+                        return none;
+                    };
                     if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         let tool_name = block
                             .get("name")
                             .and_then(|n| n.as_str())
-                            .unwrap_or("tool");
-                        Some(format!("\r\n\x1b[1;33m⚡ {}\x1b[0m ", tool_name))
+                            .unwrap_or("tool")
+                            .to_string();
+                        AgentOutput {
+                            text: Some(format!(
+                                "\r\n\x1b[1;33m⚡ {}\x1b[0m ",
+                                tool_name
+                            )),
+                            update: BlockUpdate::ToolStart {
+                                name: tool_name,
+                            },
+                        }
                     } else {
-                        None
+                        none
                     }
                 }
 
-                // End of a tool_use block — add a newline so the next
-                // text or tool starts on a fresh line.
-                "content_block_stop" => {
-                    // Only emit newline; text blocks end naturally with
-                    // their own content. A single \n is enough separation.
-                    Some("\r\n".to_string())
-                }
+                "content_block_stop" => AgentOutput {
+                    text: Some("\r\n".to_string()),
+                    update: BlockUpdate::ContentBlockStop,
+                },
 
-                _ => None,
+                _ => none,
             }
         }
 
-        // System init — log session ID for --resume support later.
         "system" => {
-            let subtype = json.get("subtype").and_then(|s| s.as_str())?;
-            if subtype == "init" {
+            let subtype = json.get("subtype").and_then(|s| s.as_str());
+            if subtype == Some("init") {
                 if let Some(sid) = json.get("session_id").and_then(|s| s.as_str()) {
                     debug!(session_id = sid, "agent session started");
                 }
             }
-            None
+            none
         }
 
-        // Result — text was already streamed. Skip to avoid extra blank
-        // lines.
-        "result" | "assistant" | "rate_limit_event" => None,
-
-        _ => None,
+        "result" | "assistant" | "rate_limit_event" => none,
+        _ => none,
     }
 }

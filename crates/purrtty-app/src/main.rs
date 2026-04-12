@@ -17,7 +17,8 @@ mod urls;
 
 use std::sync::{Arc, Mutex};
 
-use agent::AgentSession;
+use agent::{AgentSession, BlockUpdate};
+use block::Block;
 use config::Config;
 use selection::{pixel_to_cell, selection_to_text, view_row_to_absolute, GridPoint, Selection};
 
@@ -83,6 +84,10 @@ struct Session {
     pty: PtySession,
     terminal: SharedTerminal,
     agent_session: Option<AgentSession>,
+    /// Active agent block (if any). Shared with the reader thread via
+    /// Arc<Mutex<>> so the reader can push segments while the main
+    /// thread reads for rendering.
+    block: Option<std::sync::Arc<std::sync::Mutex<Block>>>,
     /// Preserved scroll/selection/input-mode state for this tab while
     /// it is NOT the active tab. Unused for the active tab.
     saved: SavedSessionState,
@@ -250,6 +255,7 @@ impl PurrttyApp {
             pty,
             terminal,
             agent_session: None,
+            block: None,
             saved: SavedSessionState::default(),
         })
     }
@@ -707,7 +713,6 @@ impl PurrttyApp {
     fn spawn_agent(&mut self, prompt: String) {
         let Some(session) = self.sessions.get(self.active) else { return };
         let session_id = session.id;
-        // Try OSC 7 first, then lsof on the shell PID, then purrtty's own cwd.
         let cwd = session
             .terminal
             .lock()
@@ -716,6 +721,16 @@ impl PurrttyApp {
             .or_else(|| session.pty.child_pid().and_then(shell_cwd_via_lsof))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+        // Create the block and share it with the reader thread.
+        let start_row = session
+            .terminal
+            .lock()
+            .ok()
+            .map(|t| t.grid().scrollback_len() + t.grid().cursor().row)
+            .unwrap_or(0);
+        let block = Arc::new(Mutex::new(Block::new(prompt.clone(), start_row)));
+        let block_for_reader = block.clone();
+
         let terminal_for_agent = session.terminal.clone();
         let proxy = self.proxy.clone().unwrap();
 
@@ -723,9 +738,22 @@ impl PurrttyApp {
         match AgentSession::spawn(
             &prompt,
             &cwd,
-            move |bytes| {
-                if let Ok(mut term) = terminal_for_agent.lock() {
-                    term.advance(bytes);
+            move |output| {
+                // Echo ANSI text to the terminal grid.
+                if let Some(text) = &output.text {
+                    if let Ok(mut term) = terminal_for_agent.lock() {
+                        term.advance(text.as_bytes());
+                    }
+                }
+                // Feed the block state machine.
+                if let Ok(mut blk) = block_for_reader.lock() {
+                    match output.update {
+                        BlockUpdate::TextDelta(ref t) => blk.push_text(t),
+                        BlockUpdate::ToolStart { ref name } => blk.start_tool(name),
+                        BlockUpdate::ToolInput(ref j) => blk.push_tool_input(j),
+                        BlockUpdate::ContentBlockStop => blk.finish_tool(),
+                        BlockUpdate::None => {}
+                    }
                 }
                 let _ = proxy.send_event(UserEvent::PtyDataArrived { session_id });
             },
@@ -740,6 +768,7 @@ impl PurrttyApp {
                 info!(?cwd, "agent spawned");
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     sess.agent_session = Some(agent);
+                    sess.block = Some(block);
                 }
             }
             Err(err) => {
@@ -876,6 +905,12 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                 let Some(idx) = self.session_index_by_id(session_id) else { return };
                 if let Some(session) = self.sessions.get_mut(idx) {
                     session.agent_session = None;
+                    // Mark the block as done so the overlay shows ✓/✗.
+                    if let Some(block) = session.block.as_ref() {
+                        if let Ok(mut b) = block.lock() {
+                            b.set_done(exit_code);
+                        }
+                    }
                 }
                 let marker = if exit_code == 0 {
                     "\r\n\x1b[1;32m✓ agent done\x1b[0m\r\n"
