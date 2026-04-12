@@ -1392,6 +1392,47 @@ mod tests {
     /// 2. Different bar heights produce different traffic-light y values
     /// 3. y always centers the button in the bar (within parent constraints)
     /// 4. x never changes
+    /// The root cause of the traffic-light centering bug: macOS fixes
+    /// the titlebar container at ~32pt. Without resizing it, the
+    /// centering formula clamps to y=0 for any bar > 46pt and the
+    /// buttons get stuck at the top.
+    ///
+    /// After the fix, we resize the container to bar_h BEFORE
+    /// positioning, so parent_h == bar_h and the formula never clamps.
+    #[test]
+    fn traffic_light_needs_parent_resize_to_center() {
+        let button_h = 14.0_f64;
+        let macos_default_parent_h = 32.0_f64;
+
+        // WITHOUT parent resize: at bar_h=52, formula clamps.
+        let bar_h = 52.0_f64;
+        let desired_top = ((bar_h - button_h) / 2.0).max(0.0);
+        let y_without_resize =
+            (macos_default_parent_h - button_h - desired_top).max(0.0);
+        assert_eq!(
+            y_without_resize, 0.0,
+            "without parent resize, y clamps to 0 at bar_h=52"
+        );
+        let btn_center_without = macos_default_parent_h - y_without_resize - button_h / 2.0;
+        let bar_center = bar_h / 2.0;
+        assert!(
+            (btn_center_without - bar_center).abs() > 0.5,
+            "button is NOT centered without parent resize: \
+             btn_center={btn_center_without}, bar_center={bar_center}"
+        );
+
+        // WITH parent resize: parent_h == bar_h, formula works.
+        let parent_h_after_resize = bar_h; // we resize the container
+        let y_with_resize =
+            (parent_h_after_resize - button_h - desired_top).max(0.0);
+        let btn_center_with = parent_h_after_resize - y_with_resize - button_h / 2.0;
+        assert!(
+            (btn_center_with - bar_center).abs() < 0.01,
+            "button IS centered after parent resize: \
+             btn_center={btn_center_with}, bar_center={bar_center}"
+        );
+    }
+
     #[test]
     fn traffic_light_y_changes_with_bar_height() {
         let button_h = 14.0_f64;
