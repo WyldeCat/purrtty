@@ -87,14 +87,11 @@ pub fn reposition_traffic_lights(window: &Window, bar_height_logical_px: f32) {
             new_y,
             "repositioning traffic light"
         );
-        // Shift x so the left-edge padding matches the top-edge
-        // padding for equal inset on both axes. Uses the ORIGINAL
-        // default x (not the live frame) so repeated calls are
-        // idempotent — no drift across zoom cycles.
-        let x_offset = desired_top - DEFAULT_X[0];
-        let new_x = original_x + x_offset;
+        // x stays at the macOS default — only y moves for vertical
+        // centering. Left padding is fixed; top padding grows with
+        // bar height.
         let new_origin = NSPoint {
-            x: new_x,
+            x: original_x,
             y: new_y,
         };
         // SAFETY: setFrameOrigin: is a standard NSView method; the
@@ -112,20 +109,13 @@ pub fn reposition_traffic_lights(window: &Window, bar_height_logical_px: f32) {
     }
 }
 
-/// Compute the left inset for the tab bar so tabs start to the right
-/// of the traffic lights. Returns the x position just past the last
-/// button + a small padding gap. Scales with bar height because the
-/// traffic lights shift right for equal top/left padding.
-pub fn tab_bar_left_inset(bar_height: f32) -> f32 {
-    let button_h = 14.0_f64;
-    let bar_h = bar_height as f64;
-    let desired_top = ((bar_h - button_h) / 2.0).max(0.0);
-    let x_offset = desired_top - DEFAULT_X[0];
-    // Last button (zoom) right edge = default_x + offset + button_width.
-    let last_x = DEFAULT_X[2] + x_offset;
+/// Fixed left inset for the tab bar: tabs start to the right of the
+/// traffic lights. Traffic lights stay at their macOS default x, so
+/// this is constant regardless of bar height or zoom level.
+pub fn tab_bar_left_inset() -> f32 {
     let button_w = 14.0_f64;
     let padding = 10.0_f64;
-    (last_x + button_w + padding) as f32
+    (DEFAULT_X[2] + button_w + padding) as f32
 }
 
 /// Walk from winit's NSView handle up to the containing NSWindow.

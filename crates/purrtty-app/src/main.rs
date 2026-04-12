@@ -216,7 +216,7 @@ impl PurrttyApp {
             macos::reposition_traffic_lights(window, bar_h);
         }
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_tab_bar_left_inset(macos::tab_bar_left_inset(bar_h));
+            renderer.set_tab_bar_left_inset(macos::tab_bar_left_inset());
         }
     }
 
