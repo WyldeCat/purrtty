@@ -115,6 +115,30 @@ pub struct Grid {
     /// parser queued. The app layer drains this after each advance()
     /// and writes the bytes back to the PTY.
     response_queue: Vec<Vec<u8>>,
+
+    /// Shell integration blocks (OSC 133). Each block tracks a
+    /// prompt-command-output cycle.
+    blocks: Vec<TermBlock>,
+}
+
+/// A single prompt-command-output block, tracked via OSC 133 marks.
+#[derive(Debug, Clone)]
+pub struct TermBlock {
+    /// Absolute grid row where this block starts (prompt line).
+    pub start_row: usize,
+    /// Lifecycle state.
+    pub state: TermBlockState,
+}
+
+/// Lifecycle of a shell block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermBlockState {
+    /// Prompt visible, user is typing (mark A received).
+    Input,
+    /// User pressed Enter, command running (marks B/C received).
+    Running,
+    /// Command finished with the given exit code (mark D received).
+    Done { exit_code: i32 },
 }
 
 impl Grid {
@@ -138,6 +162,7 @@ impl Grid {
             primary_snapshot: None,
             cwd: None,
             response_queue: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -788,6 +813,46 @@ impl Grid {
 
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    // ---------- shell integration blocks (OSC 133) ----------
+
+    pub fn blocks(&self) -> &[TermBlock] {
+        &self.blocks
+    }
+
+    /// OSC 133;A — prompt start. Begin a new block at the current row.
+    pub fn mark_prompt_start(&mut self) {
+        let abs_row = self.scrollback.len() + self.cursor.row;
+        self.blocks.push(TermBlock {
+            start_row: abs_row,
+            state: TermBlockState::Input,
+        });
+    }
+
+    /// OSC 133;B — command start. Transition the current block to Running.
+    pub fn mark_command_start(&mut self) {
+        if let Some(b) = self.blocks.last_mut() {
+            if b.state == TermBlockState::Input {
+                b.state = TermBlockState::Running;
+            }
+        }
+    }
+
+    /// OSC 133;C — output start. Also transitions to Running if not already.
+    pub fn mark_output_start(&mut self) {
+        if let Some(b) = self.blocks.last_mut() {
+            if b.state == TermBlockState::Input {
+                b.state = TermBlockState::Running;
+            }
+        }
+    }
+
+    /// OSC 133;D — command done with exit code.
+    pub fn mark_command_done(&mut self, exit_code: i32) {
+        if let Some(b) = self.blocks.last_mut() {
+            b.state = TermBlockState::Done { exit_code };
+        }
     }
 
     // ---------- SGR ----------

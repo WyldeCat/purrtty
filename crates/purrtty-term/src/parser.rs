@@ -212,6 +212,28 @@ impl Perform for GridPerformer<'_> {
                 }
             }
         }
+        // OSC 133: shell integration / semantic prompt marks.
+        // `\e]133;X\a` where X is A, B, C, or D[;exit_code].
+        if params.first() == Some(&&b"133"[..]) {
+            if let Some(mark) = params.get(1) {
+                match mark.first() {
+                    Some(b'A') => self.grid.mark_prompt_start(),
+                    Some(b'B') => self.grid.mark_command_start(),
+                    Some(b'C') => self.grid.mark_output_start(),
+                    Some(b'D') => {
+                        // Exit code is in the next param: `\e]133;D;N\a`
+                        // → params = ["133", "D", "N"].
+                        let exit_code = params
+                            .get(2)
+                            .and_then(|s| std::str::from_utf8(s).ok())
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(0);
+                        self.grid.mark_command_done(exit_code);
+                    }
+                    _ => {}
+                }
+            }
+        }
         // OSC 0/1/2 (title) and others: accepted silently.
     }
 }

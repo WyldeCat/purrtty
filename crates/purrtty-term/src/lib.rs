@@ -387,6 +387,54 @@ mod tests {
         assert_eq!(row_text(t.grid(), 1).trim_end(), "bar");
     }
 
+    // ── OSC 133 (shell integration blocks) ──
+
+    #[test]
+    fn osc133_mark_a_creates_block() {
+        let mut t = Terminal::new(4, 20);
+        t.advance(b"\x1b]133;A\x07");
+        let blocks = t.grid().blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].state, crate::grid::TermBlockState::Input);
+    }
+
+    #[test]
+    fn osc133_full_lifecycle() {
+        let mut t = Terminal::new(4, 20);
+        // Shell prints prompt.
+        t.advance(b"\x1b]133;A\x07$ ");
+        assert_eq!(t.grid().blocks().len(), 1);
+        // User presses Enter.
+        t.advance(b"\x1b]133;B\x07\x1b]133;C\x07");
+        assert_eq!(
+            t.grid().blocks()[0].state,
+            crate::grid::TermBlockState::Running
+        );
+        // Command output.
+        t.advance(b"hello world\r\n");
+        // Command done, exit 0.
+        t.advance(b"\x1b]133;D;0\x07");
+        assert_eq!(
+            t.grid().blocks()[0].state,
+            crate::grid::TermBlockState::Done { exit_code: 0 }
+        );
+        // Next prompt → second block.
+        t.advance(b"\x1b]133;A\x07$ ");
+        assert_eq!(t.grid().blocks().len(), 2);
+    }
+
+    #[test]
+    fn osc133_error_exit_code() {
+        let mut t = Terminal::new(4, 20);
+        t.advance(b"\x1b]133;A\x07$ ");
+        t.advance(b"\x1b]133;B\x07\x1b]133;C\x07");
+        t.advance(b"\x1b]133;D;127\x07");
+        assert_eq!(
+            t.grid().blocks()[0].state,
+            crate::grid::TermBlockState::Done { exit_code: 127 }
+        );
+    }
+
     /// Zoom-in then zoom-out should preserve content that was briefly
     /// cropped out during the small size.
     #[test]
