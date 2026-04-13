@@ -387,6 +387,106 @@ fn osc133_multiple_enters_keeps_prompt_visible() {
     eprintln!("cursor_y: {cursor_y}, min_y: {min_y}, visible: {}", cursor_y + line_h >= min_y);
 }
 
+/// Full visual layout dump after rapid Enters — uses the same math
+/// as the renderer's FrameLayout to show exactly which rows are
+/// visible and where they land. This IS the frame_dump, running in
+/// test instead of the live app.
+#[test]
+fn frame_dump_after_rapid_enters() {
+    let terminal = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let responses: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let term_for_reader = terminal.clone();
+    let resp_for_reader = responses.clone();
+
+    let mut pty = PtySession::spawn(24, 80, move |bytes| {
+        if let Ok(mut term) = term_for_reader.lock() {
+            term.advance(bytes);
+            let resps = term.grid_mut().drain_responses();
+            if !resps.is_empty() {
+                resp_for_reader.lock().unwrap().extend(resps);
+            }
+        }
+    })
+    .expect("spawn");
+
+    thread::sleep(Duration::from_millis(800));
+    let resps: Vec<Vec<u8>> = std::mem::take(&mut *responses.lock().unwrap());
+    for resp in resps { let _ = pty.write(&resp); }
+    thread::sleep(Duration::from_millis(500));
+
+    // Send 15 Enters with OSC 133 marks injected.
+    for _ in 0..15 {
+        {
+            let mut term = terminal.lock().unwrap();
+            term.advance(b"\x1b]133;A\x07");
+        }
+        let _ = pty.write(b"\r");
+        thread::sleep(Duration::from_millis(200));
+        let resps: Vec<Vec<u8>> = std::mem::take(&mut *responses.lock().unwrap());
+        for resp in resps { let _ = pty.write(&resp); }
+    }
+    {
+        let mut term = terminal.lock().unwrap();
+        term.advance(b"\x1b]133;A\x07");
+    }
+    thread::sleep(Duration::from_millis(500));
+
+    let term = terminal.lock().unwrap();
+    let grid = term.grid();
+    let rows = grid.rows();
+    let cursor = grid.cursor();
+    let blocks = grid.blocks();
+    let sb_len = grid.scrollback_len();
+
+    // Compute FrameLayout equivalent.
+    let line_h = 24.0_f32;
+    let base_grid_top = 58.0_f32;
+    let block_pad_raw = (line_h * 0.5).max(8.0);
+    let first_abs = sb_len;
+    let view_boundaries: Vec<usize> = blocks.iter().filter_map(|b| {
+        let v = b.start_row.checked_sub(first_abs)?;
+        if v > 0 && v < rows { Some(v) } else { None }
+    }).collect();
+    let grid_area = rows as f32 * line_h;
+    let max_pad = grid_area * 0.25;
+    let raw_count = view_boundaries.iter().filter(|&&s| s <= rows - 1).count();
+    let raw_padding = raw_count as f32 * block_pad_raw;
+    let capped = raw_padding.min(max_pad);
+    let eff_pad = if raw_count > 0 { capped / raw_count as f32 } else { block_pad_raw };
+    let grid_top = base_grid_top - capped;
+    let min_y = base_grid_top;
+
+    let row_y = |vr: usize| -> f32 {
+        let n = view_boundaries.iter().filter(|&&s| s <= vr).count();
+        grid_top + vr as f32 * line_h + n as f32 * eff_pad
+    };
+
+    eprintln!("=== FRAME DUMP (test) ===");
+    eprintln!("rows={rows} sb_len={sb_len} blocks={} boundaries={:?}",
+        blocks.len(), view_boundaries);
+    eprintln!("grid_top={grid_top:.1} eff_pad={eff_pad:.1} capped={capped:.1}");
+    eprintln!("cursor=({},{})", cursor.row, cursor.col);
+    eprintln!("---");
+
+    let mut cursor_visible = false;
+    for vr in 0..rows {
+        let y = row_y(vr);
+        let vis = y + line_h >= min_y;
+        let mut text = String::new();
+        for c in 0..grid.cols().min(50) {
+            let ch = grid.cell(vr, c).ch;
+            if ch != '\0' { text.push(ch); }
+        }
+        let text = text.trim_end();
+        let marker = if vr == cursor.row { " <<<CURSOR" } else { "" };
+        let sep = if view_boundaries.contains(&vr) { " [SEP]" } else { "" };
+        eprintln!("row {vr:2}: y={y:7.1} vis={vis:<5}{sep} |{text}|{marker}");
+        if vr == cursor.row { cursor_visible = vis; }
+    }
+
+    assert!(cursor_visible, "CURSOR ROW IS NOT VISIBLE!");
+}
+
 /// Pressing Enter on an empty prompt should produce a new prompt.
 /// Reproduces a bug where the new prompt didn't appear after OSC 133
 /// shell integration was enabled.
