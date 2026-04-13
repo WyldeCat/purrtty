@@ -296,6 +296,22 @@ impl Renderer {
         let mut glyph_verts: Vec<GlyphVertex> = Vec::with_capacity(rows * cols);
         let mut bg_verts: Vec<QuadVertex> = Vec::new();
 
+        // Pre-compute block boundary view-rows for Y-offset. Each
+        // boundary inserts visual spacing so blocks don't run together.
+        let block_pad = (line_h * 0.4).max(6.0);
+        let block_boundary_rows: Vec<usize> = blocks
+            .iter()
+            .filter(|b| b.start_view_row > 0 && b.start_view_row < rows)
+            .map(|b| b.start_view_row)
+            .collect();
+        let y_offset_for_row = |view_row: usize| -> f32 {
+            let n = block_boundary_rows
+                .iter()
+                .filter(|&&s| s <= view_row)
+                .count();
+            n as f32 * block_pad
+        };
+
         // Link accent color for hovered URLs.
         let link_color = [
             srgb_to_linear(0.36),
@@ -319,14 +335,13 @@ impl Renderer {
                 }
 
                 let (base_fg, bg_opt) = self.cell_colors(cell);
-                // Override fg with link color when this cell is inside
-                // the currently-hovered URL span.
                 let fg_color = match hover_in_row {
                     Some((s, e)) if col_idx >= s && col_idx < e => link_color,
                     _ => base_fg,
                 };
                 let cell_x = PAD_X + col_idx as f32 * cell_w;
-                let cell_y = grid_top + view_idx as f32 * line_h;
+                let cell_y = grid_top + view_idx as f32 * line_h
+                    + y_offset_for_row(view_idx);
 
                 // Background quad.
                 if let Some(bg) = bg_opt {
@@ -365,7 +380,8 @@ impl Renderer {
             if cursor.row < rows && cols > 0 {
                 let col = cursor.col.min(cols - 1);
                 let x = PAD_X + col as f32 * cell_w;
-                let y = grid_top + cursor.row as f32 * line_h;
+                let y = grid_top + cursor.row as f32 * line_h
+                    + y_offset_for_row(cursor.row);
                 let cursor_gray = srgb_to_linear(0.85);
                 QuadRenderer::push_rect(
                     &mut overlay_verts,
@@ -383,7 +399,8 @@ impl Renderer {
         if let Some((view_row, start_col, end_col)) = hovered_url {
             if view_row < rows && start_col < cols && end_col <= cols && end_col > start_col {
                 let x = PAD_X + start_col as f32 * cell_w;
-                let y = grid_top + view_row as f32 * line_h + line_h - 2.0;
+                let y = grid_top + view_row as f32 * line_h
+                    + y_offset_for_row(view_row) + line_h - 2.0;
                 let w = (end_col - start_col) as f32 * cell_w;
                 QuadRenderer::push_rect(
                     &mut overlay_verts,
@@ -421,7 +438,8 @@ impl Renderer {
                     continue;
                 }
                 let x = PAD_X + row_start as f32 * cell_w;
-                let y = grid_top + view_idx as f32 * line_h;
+                let y = grid_top + view_idx as f32 * line_h
+                    + y_offset_for_row(view_idx);
                 let w = (row_end - row_start) as f32 * cell_w;
                 QuadRenderer::push_rect(&mut overlay_verts, x, y, w, line_h, select_color);
             }
@@ -444,14 +462,15 @@ impl Renderer {
         let grid_left = PAD_X - 4.0;
         let grid_w = cols as f32 * cell_w + 8.0;
 
-        let block_pad_y = (line_h * 0.3).max(4.0);
-
         for blk in blocks {
             if blk.end_view_row <= blk.start_view_row {
                 continue;
             }
-            let by = grid_top + blk.start_view_row as f32 * line_h - block_pad_y;
-            let bh = (blk.end_view_row - blk.start_view_row) as f32 * line_h + block_pad_y * 2.0;
+            let by = grid_top + blk.start_view_row as f32 * line_h
+                + y_offset_for_row(blk.start_view_row);
+            let by_end = grid_top + blk.end_view_row as f32 * line_h
+                + y_offset_for_row(blk.end_view_row.saturating_sub(1));
+            let bh = by_end - by + line_h;
 
             // Horizontal separator at the TOP of each block (except
             // the very first visible block — it's at the top already).

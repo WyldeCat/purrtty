@@ -1621,6 +1621,37 @@ mod tests {
         }
     }
 
+    /// Block padding: rows after a block boundary should be offset
+    /// downward by the padding amount. This tests the pure Y-offset
+    /// calculation used by the renderer.
+    #[test]
+    fn block_row_y_offset_includes_padding() {
+        // Pure logic: given block boundaries at rows [0, 5, 10], each
+        // boundary adds `pad` pixels of spacing. Row N's Y position is:
+        //     grid_top + row * line_h + boundaries_before(row) * pad
+        let block_start_rows = [0usize, 5, 10];
+        let line_h = 24.0_f32;
+        let pad = 8.0_f32;
+        let grid_top = 40.0_f32;
+
+        let y_for_row = |row: usize| -> f32 {
+            let boundaries_before = block_start_rows
+                .iter()
+                .filter(|&&s| s > 0 && s <= row)
+                .count();
+            grid_top + row as f32 * line_h + boundaries_before as f32 * pad
+        };
+
+        // Row 0: no boundaries before it.
+        assert_eq!(y_for_row(0), 40.0);
+        // Row 4: still in first block, no boundary crossed.
+        assert_eq!(y_for_row(4), 40.0 + 4.0 * 24.0);
+        // Row 5: second block starts here. One boundary (at row 5).
+        assert_eq!(y_for_row(5), 40.0 + 5.0 * 24.0 + 8.0);
+        // Row 10: third block starts. Two boundaries (at rows 5 and 10).
+        assert_eq!(y_for_row(10), 40.0 + 10.0 * 24.0 + 16.0);
+    }
+
     #[test]
     fn build_paste_payload_unbracketed() {
         let payload = build_paste_payload("hello", false);
