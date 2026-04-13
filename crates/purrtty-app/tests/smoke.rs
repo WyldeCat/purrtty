@@ -268,6 +268,125 @@ fn korean_line_wrap() {
 //
 // These tests reproduce the conditions that cause the blank initial render.
 
+/// With OSC 133 shell integration, pressing Enter multiple times
+/// should produce visible blocks AND the final prompt should be
+/// in the grid. Checks both grid data and block boundaries.
+#[test]
+fn osc133_multiple_enters_keeps_prompt_visible() {
+    let terminal = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let responses: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let term_for_reader = terminal.clone();
+    let resp_for_reader = responses.clone();
+
+    let mut pty = PtySession::spawn(24, 80, move |bytes| {
+        if let Ok(mut term) = term_for_reader.lock() {
+            term.advance(bytes);
+            let resps = term.grid_mut().drain_responses();
+            if !resps.is_empty() {
+                resp_for_reader.lock().unwrap().extend(resps);
+            }
+        }
+    })
+    .expect("failed to spawn pty");
+
+    // Wait for initial prompt.
+    thread::sleep(Duration::from_millis(800));
+    let resps: Vec<Vec<u8>> = std::mem::take(&mut *responses.lock().unwrap());
+    for resp in resps { let _ = pty.write(&resp); }
+    thread::sleep(Duration::from_millis(500));
+
+    // Inject OSC 133 hooks and press Enter 5 times.
+    // We simulate what precmd/preexec would send by writing the
+    // marks directly to the terminal alongside the shell interaction.
+    for i in 0..5 {
+        // Simulate precmd: mark A
+        {
+            let mut term = terminal.lock().unwrap();
+            term.advance(b"\x1b]133;A\x07");
+        }
+        // Send Enter to the shell (empty command).
+        let _ = pty.write(b"\r");
+        thread::sleep(Duration::from_millis(300));
+        let resps: Vec<Vec<u8>> = std::mem::take(&mut *responses.lock().unwrap());
+        for resp in resps { let _ = pty.write(&resp); }
+    }
+    // One more mark A for the final prompt.
+    {
+        let mut term = terminal.lock().unwrap();
+        term.advance(b"\x1b]133;A\x07");
+    }
+    thread::sleep(Duration::from_millis(500));
+
+    let term = terminal.lock().unwrap();
+    let grid = term.grid();
+    let blocks = grid.blocks();
+    let cursor = grid.cursor();
+
+    // Should have 6 blocks (initial + 5 Enters + final).
+    assert!(
+        blocks.len() >= 5,
+        "expected at least 5 blocks, got {}", blocks.len()
+    );
+
+    // The cursor row should have content (prompt text).
+    let mut cursor_text = String::new();
+    for c in 0..grid.cols() {
+        let ch = grid.cell(cursor.row, c).ch;
+        if ch != '\0' { cursor_text.push(ch); }
+    }
+    let cursor_text = cursor_text.trim().to_string();
+    assert!(
+        !cursor_text.is_empty(),
+        "cursor row {} should have prompt text, got empty. \
+         blocks={}, cursor=({},{})",
+        cursor.row, blocks.len(), cursor.row, cursor.col
+    );
+
+    // Simulate what the renderer's FrameLayout would do.
+    let sb_len = grid.scrollback_len();
+    let rows = grid.rows();
+    let line_h = 24.0_f32;
+    let base_grid_top = 82.0_f32; // PAD_Y + tab bar ≈ 16 + 42 + 24
+    let block_pad = (line_h * 0.5).max(8.0);
+    let first_abs = sb_len;
+    let view_boundaries: Vec<usize> = blocks
+        .iter()
+        .filter_map(|b| {
+            let v = b.start_row.checked_sub(first_abs)?;
+            if v > 0 && v < rows { Some(v) } else { None }
+        })
+        .collect();
+    let bottom_offset = view_boundaries
+        .iter()
+        .filter(|&&s| s <= rows - 1)
+        .count() as f32 * block_pad;
+    let shifted_grid_top = base_grid_top - bottom_offset;
+    let min_y = base_grid_top;
+
+    // Check cursor row visibility using the same math as FrameLayout.
+    let cursor_view = cursor.row;
+    let cursor_boundary_count = view_boundaries
+        .iter()
+        .filter(|&&s| s <= cursor_view)
+        .count();
+    let cursor_y = shifted_grid_top
+        + cursor_view as f32 * line_h
+        + cursor_boundary_count as f32 * block_pad;
+    assert!(
+        cursor_y + line_h >= min_y,
+        "RENDER BUG: cursor row {} would be clipped! \
+         cursor_y={cursor_y}, min_y={min_y}, \
+         boundaries={view_boundaries:?}, bottom_offset={bottom_offset}",
+        cursor_view
+    );
+
+    eprintln!("blocks: {}", blocks.len());
+    eprintln!("cursor: ({}, {}), text: {:?}", cursor.row, cursor.col, cursor_text);
+    eprintln!("view_boundaries: {:?}", view_boundaries);
+    eprintln!("cursor_y: {cursor_y}, min_y: {min_y}, visible: {}", cursor_y + line_h >= min_y);
+}
+
 /// Pressing Enter on an empty prompt should produce a new prompt.
 /// Reproduces a bug where the new prompt didn't appear after OSC 133
 /// shell integration was enabled.

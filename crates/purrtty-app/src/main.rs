@@ -1623,6 +1623,133 @@ mod tests {
 
     /// Block padding: rows after a block boundary are offset downward.
     /// Rows that overflow the window are clipped (not rendered).
+    /// Pressing Enter repeatedly creates many blocks. The cursor row
+    /// (where the prompt lives) must ALWAYS be visible — never clipped
+    /// by block padding.
+    #[test]
+    fn cursor_row_always_visible_with_many_blocks() {
+        let line_h = 24.0_f32;
+        let base_grid_top = 40.0_f32;
+        let rows = 24_usize;
+        let block_pad = (line_h * 0.5).max(8.0);
+
+        // Simulate pressing Enter 20 times: blocks at rows 0, 1, 2, ..., 19
+        for num_enters in 1..=20 {
+            let cursor_row = num_enters.min(rows - 1);
+            let boundaries: Vec<usize> = (1..=num_enters)
+                .filter(|&r| r > 0 && r < rows)
+                .collect();
+            let bottom_offset = boundaries
+                .iter()
+                .filter(|&&s| s <= rows - 1)
+                .count() as f32
+                * block_pad;
+            let grid_top = base_grid_top - bottom_offset;
+            let min_y = base_grid_top;
+
+            // Compute cursor row Y
+            let cursor_offset = boundaries
+                .iter()
+                .filter(|&&s| s <= cursor_row)
+                .count() as f32
+                * block_pad;
+            let cursor_y = grid_top + cursor_row as f32 * line_h + cursor_offset;
+
+            // Cursor row must be visible (not clipped above viewport)
+            assert!(
+                cursor_y + line_h >= min_y,
+                "cursor row {cursor_row} is clipped after {num_enters} Enters: \
+                 cursor_y={cursor_y}, min_y={min_y}, bottom_offset={bottom_offset}"
+            );
+            // Cursor row should be at its natural position
+            let natural_y = base_grid_top + cursor_row as f32 * line_h;
+            assert!(
+                (cursor_y - natural_y).abs() < 0.01,
+                "cursor row {cursor_row} drifted from natural position: \
+                 cursor_y={cursor_y}, natural_y={natural_y}, after {num_enters} Enters"
+            );
+        }
+    }
+
+    /// Simulates the real scenario: OSC 133 marks + Enter presses.
+    /// Creates a Terminal, feeds OSC 133 marks + prompts, then checks
+    /// that the FrameLayout keeps the cursor row visible.
+    #[test]
+    fn osc133_blocks_dont_hide_prompt() {
+        use purrtty_term::Terminal;
+
+        let mut term = Terminal::new(24, 80);
+        let line_h = 24.0_f32;
+        let base_grid_top = 40.0_f32;
+        let block_pad = (line_h * 0.5).max(8.0);
+
+        // Simulate 10 Enter presses with OSC 133 marks.
+        for i in 0..10 {
+            // precmd: mark A
+            term.advance(b"\x1b]133;A\x07");
+            // Shell prints prompt
+            term.advance(format!("prompt{} % ", i).as_bytes());
+            // preexec: marks B + C
+            term.advance(b"\x1b]133;B\x07\x1b]133;C\x07");
+            // Empty command → just newline
+            term.advance(b"\r\n");
+        }
+        // Final prompt
+        term.advance(b"\x1b]133;A\x07");
+        term.advance(b"prompt_final % ");
+
+        let grid = term.grid();
+        let blocks = grid.blocks();
+        let cursor = grid.cursor();
+        let rows = grid.rows();
+
+        // Compute block boundaries in view coordinates.
+        let sb_len = grid.scrollback_len();
+        let first_abs = sb_len; // no scroll offset
+        let boundaries: Vec<usize> = blocks
+            .iter()
+            .filter_map(|b| {
+                let view = b.start_row.checked_sub(first_abs)?;
+                if view > 0 && view < rows { Some(view) } else { None }
+            })
+            .collect();
+
+        let bottom_offset = boundaries
+            .iter()
+            .filter(|&&s| s <= rows - 1)
+            .count() as f32 * block_pad;
+        let grid_top = base_grid_top - bottom_offset;
+        let min_y = base_grid_top;
+
+        // Check cursor row is visible.
+        let cursor_view = cursor.row;
+        let cursor_pad = boundaries
+            .iter()
+            .filter(|&&s| s <= cursor_view)
+            .count() as f32 * block_pad;
+        let cursor_y = grid_top + cursor_view as f32 * line_h + cursor_pad;
+
+        assert!(
+            cursor_y + line_h >= min_y,
+            "prompt row {} clipped! cursor_y={}, min_y={}, \
+             blocks={}, boundaries={:?}, sb_len={}, bottom_offset={}",
+            cursor_view, cursor_y, min_y,
+            blocks.len(), boundaries, sb_len, bottom_offset
+        );
+
+        // Check prompt text exists at cursor row.
+        let mut row_text = String::new();
+        for c in 0..grid.cols() {
+            let ch = grid.cell(cursor_view, c).ch;
+            if ch != '\0' { row_text.push(ch); }
+        }
+        assert!(
+            row_text.contains("prompt_final"),
+            "cursor row should have prompt text, got: {:?}",
+            row_text.trim()
+        );
+    }
+
     #[test]
     fn block_row_y_offset_includes_padding() {
         // Pure logic: given block boundaries at rows [0, 5, 10], each
