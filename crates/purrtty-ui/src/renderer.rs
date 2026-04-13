@@ -481,16 +481,13 @@ impl Renderer {
             let by = grid_top + blk.start_view_row as f32 * line_h;
             let bh = (blk.end_view_row - blk.start_view_row) as f32 * line_h;
 
-            // Thin separator line between blocks. Drawn as a
-            // BACKGROUND quad so it sits behind text, not on top.
-            // Positioned at the exact boundary between the previous
-            // block's last row and this block's prompt row.
+            // Thin separator line between blocks. Uses `by` which
+            // already includes the Y-offset from block padding.
             if blk.start_view_row > 0 {
-                let boundary_y = grid_top + blk.start_view_row as f32 * line_h;
                 QuadRenderer::push_rect(
                     &mut bg_verts,
                     grid_left,
-                    boundary_y - 1.0,
+                    by - 1.0,
                     grid_w,
                     1.0,
                     separator_color,
