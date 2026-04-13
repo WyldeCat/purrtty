@@ -455,9 +455,6 @@ impl Renderer {
         let grid_left = PAD_X - 4.0;
         let grid_w = cols as f32 * cell_w + 8.0;
 
-        let block_strip_h = (line_h * 0.5).max(8.0);
-        let main_bg = self.theme.background.as_array();
-
         for blk in blocks {
             if blk.end_view_row <= blk.start_view_row {
                 continue;
@@ -465,27 +462,14 @@ impl Renderer {
             let by = grid_top + blk.start_view_row as f32 * line_h;
             let bh = (blk.end_view_row - blk.start_view_row) as f32 * line_h;
 
-            // At block boundaries (not the first block), draw an
-            // opaque background strip that covers the boundary row's
-            // top half + a 1px separator line. This creates visual
-            // spacing by hiding the content underneath.
+            // Thin separator line at the top edge of each block
+            // (except the very first). Drawn between grid rows —
+            // doesn't cover any text content.
             if blk.start_view_row > 0 {
-                let strip_y = by - block_strip_h * 0.5;
-                // Opaque background to cover any text at the boundary.
                 QuadRenderer::push_rect(
                     &mut overlay_verts,
                     grid_left,
-                    strip_y,
-                    grid_w,
-                    block_strip_h,
-                    main_bg,
-                );
-                // Thin separator line in the center of the strip.
-                let sep_y = strip_y + (block_strip_h - 1.0) * 0.5;
-                QuadRenderer::push_rect(
-                    &mut overlay_verts,
-                    grid_left,
-                    sep_y,
+                    by - 1.0,
                     grid_w,
                     1.0,
                     separator_color,
