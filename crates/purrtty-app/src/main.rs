@@ -885,10 +885,7 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyDataArrived { session_id } => {
-                // Drain pending terminal responses for the session whose
-                // PTY produced the bytes, then write them back. Only
-                // redraw when it's the active session — background tabs
-                // update silently.
+                // Drain pending terminal responses.
                 let Some(idx) = self.session_index_by_id(session_id) else { return };
                 let responses = self
                     .sessions
@@ -905,8 +902,17 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                         let _ = session.pty.write(&resp);
                     }
                 }
+                // Debounced redraw: instead of rendering every
+                // intermediate PTY state (which flashes empty rows
+                // between OSC marks and prompt text), schedule a
+                // redraw 8ms from now. Rapid PtyDataArrived events
+                // coalesce into one render showing the final state.
                 if idx == self.active {
-                    self.redraw();
+                    let proxy = self.proxy.clone().unwrap();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(8));
+                        let _ = proxy.send_event(UserEvent::DeferredRedraw);
+                    });
                 }
             }
             UserEvent::DeferredRedraw => {
