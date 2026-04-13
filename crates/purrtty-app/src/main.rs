@@ -44,6 +44,9 @@ enum UserEvent {
     PtyDataArrived { session_id: u64 },
     /// The Claude agent process exited on a specific session.
     AgentFinished { session_id: u64, exit_code: i32 },
+    /// Auto-test: sends Enter to the active PTY. Used by
+    /// PURRTTY_TEST_ENTERS to verify debounce without CGEvent.
+    TestEnter { remaining: u32 },
     /// Deferred redraw — fires ~500ms after startup to ensure the prompt
     /// is rendered even if early frames were discarded by macOS before
     /// the CAMetalLayer was presentable.
@@ -874,6 +877,20 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
 
         window.request_redraw();
 
+        // Auto-test: if PURRTTY_TEST_ENTERS is set, schedule Enter
+        // presses after the shell has time to initialize.
+        if let Ok(n) = std::env::var("PURRTTY_TEST_ENTERS") {
+            if let Ok(count) = n.parse::<u32>() {
+                let proxy_test = self.proxy.clone().unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let _ = proxy_test.send_event(UserEvent::TestEnter {
+                        remaining: count,
+                    });
+                });
+            }
+        }
+
         // Schedule a deferred redraw so the prompt is visible even if
         // macOS discards early frames before the surface is presentable.
         let proxy_for_deferred = self
@@ -921,6 +938,20 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(16));
                         let _ = proxy.send_event(UserEvent::PtyRedraw { seq });
+                    });
+                }
+            }
+            UserEvent::TestEnter { remaining } => {
+                if remaining > 0 {
+                    if let Some(session) = self.sessions.get_mut(self.active) {
+                        let _ = session.pty.write(b"\r");
+                    }
+                    let proxy = self.proxy.clone().unwrap();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        let _ = proxy.send_event(UserEvent::TestEnter {
+                            remaining: remaining - 1,
+                        });
                     });
                 }
             }
@@ -1128,7 +1159,9 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                     // Always write latest frame.
                     let _ = std::fs::write("/tmp/purrtty_frame.txt", &dump);
                     // Append "bad" frames to a separate log.
-                    if !has_text {
+                    // Skip startup frames (blocks=0 = shell hasn't
+                    // sent OSC 133 yet, nothing to debug).
+                    if !has_text && !render_blocks.is_empty() {
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new()
                             .create(true)
