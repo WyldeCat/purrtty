@@ -296,14 +296,23 @@ impl Renderer {
         let mut glyph_verts: Vec<GlyphVertex> = Vec::with_capacity(rows * cols);
         let mut bg_verts: Vec<QuadVertex> = Vec::new();
 
-        // Block boundary padding: we DON'T shift grid rows (that
-        // pushes content below the window). Instead, we'll draw
-        // opaque background strips + separator lines OVER the grid
-        // at boundary rows. This visually creates spacing without
-        // changing any Y positions.
-        // (y_offset_for_row is a no-op — kept for API compatibility
-        // with cursor / selection / URL overlay code.)
-        let y_offset_for_row = |_view_row: usize| -> f32 { 0.0 };
+        // Block boundary padding: each boundary pushes subsequent rows
+        // down by block_pad pixels. Rows whose offset pushes them
+        // below the window are clipped (not rendered).
+        let block_pad = (line_h * 0.5).max(8.0);
+        let block_boundary_rows: Vec<usize> = blocks
+            .iter()
+            .filter(|b| b.start_view_row > 0 && b.start_view_row < rows)
+            .map(|b| b.start_view_row)
+            .collect();
+        let y_offset_for_row = |view_row: usize| -> f32 {
+            let n = block_boundary_rows
+                .iter()
+                .filter(|&&s| s <= view_row)
+                .count();
+            n as f32 * block_pad
+        };
+        let max_y = self.config.height as f32;
 
         // Link accent color for hovered URLs.
         let link_color = [
@@ -314,8 +323,12 @@ impl Renderer {
         ];
 
         for view_idx in 0..rows {
+            let row_y = grid_top + view_idx as f32 * line_h + y_offset_for_row(view_idx);
+            // Clip: skip rows pushed below the window by block padding.
+            if row_y + line_h > max_y {
+                break;
+            }
             let row = grid.row_at(view_idx, scroll_offset).unwrap_or(&[]);
-            // Is this row the one with the hovered URL?
             let hover_in_row = hovered_url.and_then(|(r, s, e)| {
                 if r == view_idx { Some((s, e)) } else { None }
             });

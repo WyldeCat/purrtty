@@ -1621,9 +1621,8 @@ mod tests {
         }
     }
 
-    /// Block padding: rows after a block boundary should be offset
-    /// downward by the padding amount. This tests the pure Y-offset
-    /// calculation used by the renderer.
+    /// Block padding: rows after a block boundary are offset downward.
+    /// Rows that overflow the window are clipped (not rendered).
     #[test]
     fn block_row_y_offset_includes_padding() {
         // Pure logic: given block boundaries at rows [0, 5, 10], each
