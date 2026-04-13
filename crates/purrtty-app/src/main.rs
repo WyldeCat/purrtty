@@ -1087,6 +1087,16 @@ impl ApplicationHandler<UserEvent> for PurrttyApp {
                     });
                 }
 
+                // Debug: log block layout once per unique state change.
+                if !render_blocks.is_empty() {
+                    tracing::debug!(
+                        blocks = render_blocks.len(),
+                        cursor_row = guard.grid().cursor().row,
+                        cursor_col = guard.grid().cursor().col,
+                        "redraw with blocks"
+                    );
+                }
+
                 if let Err(err) = renderer.render_with_overlays(
                     guard.grid(),
                     scroll_offset,
@@ -1674,6 +1684,83 @@ mod tests {
     /// Simulates the real scenario: OSC 133 marks + Enter presses.
     /// Creates a Terminal, feeds OSC 133 marks + prompts, then checks
     /// that the FrameLayout keeps the cursor row visible.
+    /// Simulates 30 Enters on a 23-row grid — with SCROLLING.
+    /// This is the real user scenario where blocks pile up at
+    /// the bottom rows after scrollback kicks in.
+    #[test]
+    fn osc133_scrolling_scenario_keeps_prompt() {
+        use purrtty_term::Terminal;
+
+        let mut term = Terminal::new(23, 80);
+        let line_h = 24.0_f32;
+        let base_grid_top = 82.0_f32;
+        let block_pad = (line_h * 0.5).max(8.0);
+
+        // 30 Enter presses with OSC 133 marks.
+        for i in 0..30 {
+            term.advance(b"\x1b]133;A\x07");
+            term.advance(format!("prompt{} % ", i).as_bytes());
+            term.advance(b"\x1b]133;B\x07\x1b]133;C\x07");
+            term.advance(b"\r\n");
+        }
+        term.advance(b"\x1b]133;A\x07");
+        term.advance(b"final_prompt % ");
+
+        let grid = term.grid();
+        let blocks = grid.blocks();
+        let cursor = grid.cursor();
+        let rows = grid.rows();
+        let sb_len = grid.scrollback_len();
+
+        eprintln!("rows={rows}, sb_len={sb_len}, cursor=({},{}), blocks={}",
+            cursor.row, cursor.col, blocks.len());
+
+        // Compute view boundaries like the renderer does.
+        let first_abs = sb_len;
+        let view_boundaries: Vec<usize> = blocks
+            .iter()
+            .filter_map(|b| {
+                let v = b.start_row.checked_sub(first_abs)?;
+                if v > 0 && v < rows { Some(v) } else { None }
+            })
+            .collect();
+
+        let bottom_offset = view_boundaries
+            .iter()
+            .filter(|&&s| s <= rows - 1)
+            .count() as f32 * block_pad;
+        let grid_top = base_grid_top - bottom_offset;
+        let min_y = base_grid_top;
+
+        eprintln!("view_boundaries: {:?}", view_boundaries);
+        eprintln!("bottom_offset: {bottom_offset}, grid_top: {grid_top}");
+
+        // Check EVERY row that has content: is it visible?
+        for vr in 0..rows {
+            let pad = view_boundaries.iter().filter(|&&s| s <= vr).count() as f32 * block_pad;
+            let y = grid_top + vr as f32 * line_h + pad;
+            let visible = y + line_h >= min_y;
+            if vr == cursor.row {
+                assert!(
+                    visible,
+                    "CURSOR ROW {vr} is clipped! y={y}, min_y={min_y}, \
+                     boundaries={view_boundaries:?}"
+                );
+            }
+        }
+
+        // Cursor row text.
+        let mut cursor_text = String::new();
+        for c in 0..grid.cols() {
+            let ch = grid.cell(cursor.row, c).ch;
+            if ch != '\0' { cursor_text.push(ch); }
+        }
+        assert!(
+            cursor_text.contains("final_prompt"),
+            "cursor row {} text: {:?}", cursor.row, cursor_text.trim()
+        );
+    }
+
     #[test]
     fn osc133_blocks_dont_hide_prompt() {
         use purrtty_term::Terminal;

@@ -348,17 +348,26 @@ impl Renderer {
             .filter(|b| b.start_view_row > 0 && b.start_view_row < rows)
             .map(|b| b.start_view_row)
             .collect();
-        // Shift grid_top up by the padding accumulated at the LAST
-        // visible row — this anchors the bottom of the grid (where
-        // the cursor/prompt lives) at its natural position. Using
-        // total_padding was wrong: it shifted row 0 above the
-        // viewport even when the cursor was near the top.
+        // Total padding is capped at 25% of the grid area so that
+        // rapid Enter presses (many empty blocks) don't push most
+        // of the content off-screen. Without a cap, 22 boundaries
+        // × 12px = 264px, leaving only ~9 of 23 rows visible.
+        let grid_area_h = rows as f32 * line_h;
+        let max_padding = grid_area_h * 0.25;
         let last_row = rows.saturating_sub(1);
-        let bottom_offset = block_boundaries
+        let raw_boundary_count = block_boundaries
             .iter()
             .filter(|&&s| s <= last_row)
-            .count() as f32
-            * block_pad;
+            .count();
+        let raw_padding = raw_boundary_count as f32 * block_pad;
+        let bottom_offset = raw_padding.min(max_padding);
+        // Scale block_pad down when capped so each boundary gets an
+        // equal share of the available padding.
+        let effective_pad = if raw_boundary_count > 0 {
+            bottom_offset / raw_boundary_count as f32
+        } else {
+            block_pad
+        };
         let layout = FrameLayout {
             grid_top: base_grid_top - bottom_offset,
             line_h,
@@ -366,7 +375,7 @@ impl Renderer {
             ascent,
             rows,
             cols,
-            block_pad,
+            block_pad: effective_pad,
             block_boundaries,
             min_y: base_grid_top,
             grid_left: PAD_X - 4.0,
